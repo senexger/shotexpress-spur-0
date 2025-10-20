@@ -1,51 +1,35 @@
 #include <Arduino.h>
 
-// uint8_t led_pin = 2;
-uint8_t in_pin_1 = 22;
-uint8_t in_pin_2 = 23;
-
-uint8_t pwm_frequency = 2000;
-uint8_t pwm_resolution = 8;
+#include "motor.h"
 
 void setup() {
     Serial.begin(115200);
     while (!Serial) {
-      ;
+        ;  // Wait for serial port to connect
     }
-    ledcAttach(in_pin_1, pwm_frequency, pwm_resolution);
-    ledcAttach(in_pin_2, pwm_frequency, pwm_resolution);
+
+    // Initialize the motor pins
+    //
+    motor_setup();
 }
 
 void loop() {
-    Serial.println("forward");
-    forward();
-    delay(5000);
+    Serial.println("Accelerating forward...");
+    for (int speed = 0; speed <= MAX_SPEED; speed++) {
+        moveForward(speed);
+        delay(RAMP_DELAY);
+    }
 
-    Serial.println("stop");
-    stop();
-    delay(10000);
+    Serial.println("Hold Speed");
+    delay(60000);
 
-    Serial.println("backward");
-    backward();
-    delay(5000);
+    Serial.println("Decelerating");
+    for (int speed = MAX_SPEED; speed >= 0; speed--) {
+        moveForward(speed);
+        delay(RAMP_DELAY);
+    }
 
-    Serial.println("stop");
-    stop();
-    delay(10000);
-}
-
-// Motor control functions
-void forward() {
-    ledcWrite(in_pin_1, 256);
-    ledcWrite(in_pin_2, 0);
-}
-
-void backward() {
-    ledcWrite(in_pin_1, 0);
-    ledcWrite(in_pin_2, 155);
-}
-
-void stop() {
-    ledcWrite(in_pin_1, 0);
-    ledcWrite(in_pin_2, 0);
+    Serial.println("Stopped");
+    moveStop();
+    delay(STOP_DELAY);
 }
