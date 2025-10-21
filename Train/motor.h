@@ -14,8 +14,10 @@ extern const uint16_t PWM_FREQUENCY;
 extern const uint8_t PWM_RESOLUTION;
 
 void motor_setup();
-void moveForward(int speed);
-void moveBackward(int speed);
-void moveStop();
+
+void set_speed(int speed);
+int get_speed();
+int get_direction();
+void set_stop();
 
 #endif

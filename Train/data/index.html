@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ShotExpress Motor Control</title>
+</head>
+<body>
+    <h1>Motor Control</h1>
+    <p>Current Speed: %%SPEED%%</p>
+    <p>Direction: %%DIRECTION%%</p>
+    <form action="/set" method="POST">
+        Speed: <input type="range" name="speed" min="-255" max="255" value="%%SPEED%%" style="width: 500px;"><br><br>
+        <input type="submit" value="Set Speed">
+    </form>
+    <form action="/stop" method="POST">
+        <input type="submit" value="Stop">
+    </form>
+</body>
+</html>
