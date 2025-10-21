@@ -21,30 +21,20 @@ void handle_root() {
     int speed = get_speed() * get_direction();
     page.replace("%%SPEED%%", String(speed));
 
-    String direction_str = "Stopped";
-    if (get_direction() == 1) {
-        direction_str = "Forward";
-    } else if (get_direction() == -1) {
-        direction_str = "Backward";
-    }
-    page.replace("%%DIRECTION%%", direction_str);
-
     server.send(200, "text/html", page);
 }
 
 void handle_set() {
-    int speed = server.arg("speed").toInt();
-    set_speed(speed);
-
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "OK");
+    if (server.hasArg("speed")) {
+        int speed = server.arg("speed").toInt();
+        set_speed(speed);
+    }
+    server.send(200, "text/plain", "OK");
 }
 
 void handle_stop() {
     set_stop();
-
-    server.sendHeader("Location", "/");
-    server.send(302, "text/plain", "OK");
+    server.send(200, "text/plain", "OK");
 }
 
 void web_server_setup() {

@@ -1,18 +1,220 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ShotExpress Motor Control</title>
-</head>
-<body>
-    <h1>Motor Control</h1>
-    <p>Current Speed: %%SPEED%%</p>
-    <p>Direction: %%DIRECTION%%</p>
-    <form action="/set" method="POST">
-        Speed: <input type="range" name="speed" min="-255" max="255" value="%%SPEED%%" style="width: 500px;"><br><br>
-        <input type="submit" value="Set Speed">
-    </form>
-    <form action="/stop" method="POST">
-        <input type="submit" value="Stop">
-    </form>
-</body>
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>ShotExpress Motor</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family:
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                    sans-serif;
+                background: #f2f2f7;
+                color: #1d1d1f;
+                text-align: center;
+                padding: 20px;
+                height: 100vh;
+                display: flex;
+                flex-direction: column;
+            }
+            h1 {
+                font-size: 1.8rem;
+                margin-bottom: 10px;
+            }
+            .status {
+                font-size: 1.3rem;
+                margin: 8px 0;
+                font-weight: 500;
+            }
+            .slider-container {
+                flex: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                position: relative;
+                margin: 30px 0;
+            }
+            input[type="range"] {
+                -webkit-appearance: none;
+                width: 12px;
+                height: 70vh;
+                max-height: 500px;
+                background: transparent;
+                border-radius: 6px;
+                -webkit-appearance: slider-vertical;
+                outline: none;
+            }
+            input[type="range"]::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                width: 50px;
+                height: 50px;
+                background: #007aff;
+                border-radius: 50%;
+                border: 3px solid white;
+                box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+            }
+
+            input[type="range"]::-moz-range-track {
+                background: transparent;
+                border-radius: 6px;
+                width: 12px;
+            }
+            input[type="range"]::-moz-range-thumb {
+                width: 50px;
+                height: 50px;
+                background: #007aff;
+                border-radius: 50%;
+                border: 3px solid white;
+                box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+                cursor: pointer;
+            }
+
+            .zero-mark {
+                position: absolute;
+                width: 80%;
+                height: 4px;
+                background: #ff3b30;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                border-radius: 2px;
+                z-index: 5;
+            }
+
+            .center-value {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                font-size: 2.2rem;
+                font-weight: bold;
+                color: #1d1d1f;
+                background: rgba(255, 255, 255, 0.85);
+                padding: 8px 16px;
+                border-radius: 12px;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+                backdrop-filter: blur(4px);
+                pointer-events: none;
+                min-width: 60px;
+                text-align: center;
+                z-index: 10;
+                transition: all 0.2s ease;
+            }
+
+            .center-value.offline {
+                color: #888;
+                background: rgba(240, 240, 240, 0.9);
+            }
+            .btn {
+                align-self: center;
+                background: #007aff;
+                color: white;
+                border: none;
+                padding: 16px;
+                font-size: 1.3rem;
+                border-radius: 12px;
+                margin: 10px 0;
+                width: 100%;
+                max-width: 300px;
+                font-weight: 600;
+            }
+            .stop-btn {
+                background: #ff3b30;
+            }
+            .stop-btn:active {
+                background: #cc2e26;
+            }
+            .status.offline {
+                color: #888;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>ShotExpress</h1>
+        <div class="slider-container">
+            <input
+                type="range"
+                id="speedSlider"
+                min="-255"
+                max="255"
+                value="%%SPEED%%"
+                step="1"
+                orient="vertical"
+            />
+            <div class="zero-mark">
+                <div id="centerValue" class="center-value">Start</div>
+            </div>
+        </div>
+
+        <button id="stopButton" class="btn stop-btn">Stop</button>
+
+        <script>
+            const slider = document.getElementById("speedSlider");
+            const centerValue = document.getElementById("centerValue");
+            const stopButton = document.getElementById("stopButton");
+            let lastKnownSpeed = 0;
+
+            function normalizeSpeed(val) {
+                val = parseInt(val) || 0;
+                return Math.abs(val) < 50 ? 0 : val;
+            }
+
+            function updateCenterValue(val, offline = false) {
+                centerValue.textContent = val;
+                centerValue.classList.toggle("offline", offline);
+            }
+
+            function sendSpeed(speed) {
+                fetch("/set", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    body: "speed=" + encodeURIComponent(speed),
+                })
+                    .then((r) => {
+                        if (!r.ok) throw new Error("Failed");
+                        lastKnownSpeed = speed;
+                        updateCenterValue(speed);
+                    })
+                    .catch(() => {
+                        updateCenterValue(speed, true);
+                    });
+            }
+
+            document.addEventListener("DOMContentLoaded", () => {
+                const raw = slider.getAttribute("value");
+                const initial = normalizeSpeed(raw);
+                slider.value = initial;
+                updateCenterValue(initial);
+            });
+
+            slider.addEventListener("input", () => {
+                updateCenterValue(slider.value);
+            });
+
+            slider.addEventListener("change", () => {
+                let raw = slider.value;
+                let val = normalizeSpeed(raw);
+
+                if (val !== parseInt(raw)) {
+                    slider.value = val;
+                }
+
+                sendSpeed(val);
+                updateCenterValue(val);
+            });
+
+            stopButton.addEventListener("click", () => {
+                slider.value = 0;
+                updateCenterValue(0);
+                sendSpeed(0);
+            });
+        </script>
+    </body>
 </html>
