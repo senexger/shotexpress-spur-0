@@ -1,4 +1,13 @@
+# Train project files
 .clangd.yaml
 compile_commands.json
 Train/.clang-format
 Train/credentials.h
+
+# Webserver project files
+webserver/node_modules/
+webserver/dist/
+webserver/.env
+webserver/npm-debug.log*
+webserver/yarn-debug.log*
+webserver/yarn-error.log*
