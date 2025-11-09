@@ -10,39 +10,45 @@ Webserver and train connect to an MQTT broker and communicate over the following
 
 ```
 shotexpress/
-  {trainId}/cmd              // server → train (commands)
-  {trainId}/status           // train → server (heartbeat + live state)
-  {trainId}/event/rfid       // train → server (RFID reads)
-  {trainId}/event/exec       // train → server (command lifecycle events)
-  {trainId}/presence         // birth/will retained
+  command              // server → train (commands)
+  status           // train → server (heartbeat + live state)
+  event/exec       // train → server (command lifecycle events)
+  presence         // birth/will retained
 ```
 
 Use the following QoS settings for topics:
-- "at least once" for `cmd` and `event/*`, we deduplicate in the application logic.
+- "at least once" for `command` and `event/*`, we deduplicate in the application logic.
 - `status` at "at most once", it's frequent and transient.
 
 Idempotency and ordering:
-- Every command and event carries seq (uint32, monotonically increasing per producer) and id (UUID).
+- Every command and event carries seq (uint32, monotonically increasing per producer) and id (`cmd_{$i}`, with `i` monotonically increasing).
 - Train and server deduplicate commands by id and ignores older seq than the last applied.
-
-Retention:
-- Do not retain commands on the train, retain presence only.
-- Retain as much as you want on the server, use a sqlite database to keep track of history.
 
 ## 2) Message contract
 
 All payloads are JSON, UTF‑8.
 
-### server → train: cmd
+### Common envelope
 
-Topic: `shotexpress/{trainId}/cmd` (QoS 1, not retained)
+Events end commandos have these `common_envelope` fields:
 
 ```json
 {
-  "id": "cmd_1024",
-  "seq": 231,
-  "ts_ms": 1762593665123,
-  "type": "move_to",                       // "move_to" | "stop" | "reverse" | "continue" | "wait_for_load"
+  "producer": "server",          // or "train"
+  "msg_id": "550e8400-e29b-11d4-a716-446655440000",         // str, unique per message UUID-4
+  "seq": 231,                    // uint32, per-producer monotonic
+  "ts_ms": 1762593665123         // int64 unix epoch ms
+}
+```
+
+### server → train: command
+
+Topic: `shotexpress/command` (QoS 1, not retained, with MQTT message_expiry set).
+
+```json
+{
+  ...common_envelope,
+  "cmd_type": "move_to",                       // "move_to" | "stop" | "continue" | "wait_for_load"
   "params": {
     "target": "raucherecke",
     "speed": 0.60,                         // 0.00–1.00 (normalized)
@@ -60,11 +66,41 @@ Topic: `shotexpress/{trainId}/cmd` (QoS 1, not retained)
 }
 ```
 
-If the train looses connection to the webserver, it falls back to the `offline_plan`:
+If the train looses connection to the MQTT broker, then it falls back to the `offline_plan`:
 - If the next `expected_tag` has been missed, the train slows down ("crawls") at `crawl_speed` after `approach_slowdown_ms` has passed.
 - If the train doesn't read an RFID tag for `max_run_ms_without_tag`, it stops and `IDLE`s until it receives a new server message.
 - If the train does contine reading RFID tags, it continues driving, until it reads the final `stop_on_tag`.
 - It then waits for `dwell_ms` before it goes to `IDLE` state.
+
+
+### train → server: event/exec
+
+Topic: `shotexpress/event/exec` (QoS 1, not retained)
+
+```json
+{
+  ...common_envelope,
+  "event_type": "progress",              // accepted|started|progress|completed|failed|cancelled|expired
+  "progress": { "last_tag": "tag_05", "distance_m": 2.3 },   // optional
+  "error": null                     // or { "code": "RFID_TIMEOUT", "reason": "no tag in 7s" }
+}
+```
+
+### train → server: status
+
+These are heartbeat messages from the train.
+
+Topic: `shotexpress/status` (QoS 0, not retained)
+
+```json
+{
+  ...common_envelope,
+  "state": "IDLE",                  // IDLE|RUNNING|APPROACH|DWELL|SAFE_STOP|ERROR
+  "battery_pct": 82,          // uint32 between 0 and 100
+  "status_uptime_ms": 1762593600000      // uint64, in ms for how long the current status exists
+}
+```
+
 
 ## 3) Minimal train state machine
 
@@ -72,15 +108,16 @@ Normal states running from the bar to the Raucherecke: `IDLE → RUNNING → APP
 
 - `IDLE`: Train waits and saves power. Waits for new commands from webserver.
 - `RUNNING`: Train executes a command.
-- `APPROACH`: Train is approaching a stop. It reduces speed and 
-- `DWELL`: Train waits, but remains at full networking capacity to quickly react to new commands.
+- `APPROACH`: begins after N consecutive missed expected tags, or on a configured distance/time threshold; speed = crawl_speed.
+- `SAFE_STOP`: engages on max_run_ms_without_tag, cancel, or broker disconnect; motor off, networking on; emits failed or cancelled. 
+- `DWELL`: Train is stopped and waits, but remains at full networking capacity to quickly react to new commands.
 
 **Train Pseudocode:**
 
 ```
-on cmd(move_to p):
-  if now > cmd.ts + ttl: ignore  # each webserver command has a ttl. If that expires, fall back to offline_plan
-  ack_id = cmd.id
+on command(move_to p):
+  if now > command_ts + ttl: ignore  # each webserver command has a ttl. If that expires, fall back to offline_plan
+  ack_id = msg_id
   set speed = p.speed, dir = p.direction
   deadline = now + p.offline_plan.max_run_ms_without_tag
   while running:
@@ -101,15 +138,13 @@ This should be okay for a first iteration though.
 | Schachbrett | tag_03 |
 | Midpoint 2  | tag_04 |
 | Name Vergessen | tag_05 |
-| Midpoint 3  | tag_06
+| Midpoint 3  | tag_06 |
 | Raucherecke  | tag_07 |
 
 ## Getting Started
 
 ### Train Setup
-1. Configure your WiFi credentials in `train/credentials.h`
-2. Upload the code to your ESP32/ESP8266
-3. The train will poll the central webserver
+Todo: Write this.
 
 ### Webserver Setup
 1. Navigate to the `webserver/` directory
