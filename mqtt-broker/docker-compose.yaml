@@ -1,0 +1,36 @@
+version: '3'
+services:
+  mosquitto:
+    container_name: mosquitto
+    image: eclipse-mosquitto:2.0.22-openssl
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    ports:
+       - "1883:1883"
+       - "9001:9001"
+    volumes:
+      - /Users/philipp/code/shotexpress-spur-0/mqtt-broker/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - /Users/philipp/code/shotexpress-spur-0/mqtt-broker/pwfile:/mosquitto/config/pwfile
+      - /Users/philipp/code/shotexpress-spur-0/mqtt-broker/data:/mosquitto/data
+      - /Users/philipp/code/shotexpress-spur-0/mqtt-broker/log:/mosquitto/log
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - MQTT_USERNAME=${MQTT_USERNAME:-admin}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+    command: >
+      sh -c "
+        if [ ! -s /mosquitto/config/pwfile ]; then
+          if [ -z \"$$MQTT_PASSWORD\" ]; then
+            echo 'ERROR: MQTT_PASSWORD environment variable is required!'
+            exit 1
+          fi
+          echo 'Creating default user...'
+          mosquitto_passwd -c -b /mosquitto/config/pwfile \"$$MQTT_USERNAME\" \"$$MQTT_PASSWORD\"
+        fi &&
+        chmod 0700 /mosquitto/config/pwfile &&
+        /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
+      "
