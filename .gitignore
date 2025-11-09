@@ -11,3 +11,40 @@ webserver/.env
 webserver/npm-debug.log*
 webserver/yarn-debug.log*
 webserver/yarn-error.log*
+
+mqtt-broker/pwfile
+mqtt-broker/.env
+mqtt-broker/data/mosquitto.db
+
+# General ignores
+.DS_Store
+*.log
+*.tmp
+*.swp
+*.swo
+
+# JavaScript/TypeScript projects
+node_modules/
+dist/
+build/
+.pnp.*
+.pnpm-store/
+
+# Next.js
+.next/
+.turbo/
+out/
+.vercel/
+
+# Environment files
+.env
+webserver/.env.local
+.env.development
+.env.production
+.env.test
+!.env.example
+
+# IDE and tooling
+.vscode/
+.idea/
+*.code-workspace

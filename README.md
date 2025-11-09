@@ -13,7 +13,6 @@ shotexpress/
   command              // server → train (commands)
   status           // train → server (heartbeat + live state)
   event/exec       // train → server (command lifecycle events)
-  presence         // birth/will retained
 ```
 
 Use the following QoS settings for topics:
