@@ -5,8 +5,8 @@ A TypeScript-based HTTP server that controls the ShotExpress train via REST API 
 ## Getting Started
 
 ### Prerequisites
-- Node.js (v16 or higher)
-- npm or yarn
+- nvm (project Node version is pinned via `.nvmrc`)
+- pnpm
 
 ### Installation
 
@@ -15,26 +15,32 @@ A TypeScript-based HTTP server that controls the ShotExpress train via REST API 
    cd webserver
    ```
 
-2. Install dependencies:
+2. Align your Node.js version with `.nvmrc`:
+  ```bash
+  nvm install
+  nvm use
+  ```
+
+3. Install dependencies:
    ```bash
-   npm install
+  pnpm install
    ```
 
-3. Build the project:
+4. Build the project:
    ```bash
-   npm run build
+  pnpm build
    ```
 
-4. Start the server:
+5. Start the server:
    ```bash
-   npm start
+  pnpm start
    ```
 
 ### Development
 
 For development with auto-compilation:
 ```bash
-npm run watch
+pnpm watch
 ```
 
 ## API Endpoints

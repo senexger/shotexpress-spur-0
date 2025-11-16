@@ -147,6 +147,7 @@ Todo: Write this.
 
 ### Webserver Setup
 1. Navigate to the `webserver/` directory
-2. Run `pnpm install` to install dependencies
-3. Run `npm run build` to compile TypeScript
-4. Run `npm run dev` to start the development server
+2. Run `nvm install` (first time) and `nvm use` to switch to the version pinned in `.nvmrc`
+3. Run `pnpm install` to install dependencies
+4. Run `pnpm build` to compile TypeScript
+5. Run `pnpm dev` to start the development server
