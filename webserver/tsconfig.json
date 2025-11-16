@@ -30,6 +30,10 @@
   },
   "include": [
     "app/**/*",
+    "components/**/*",
+    "hooks/**/*",
+    "lib/**/*",
+    "scripts/**/*",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],

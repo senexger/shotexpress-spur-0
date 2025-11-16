@@ -1,108 +1,59 @@
-# ShotExpress Webserver
+# ShotExpress Webserver (Next.js)
 
-A TypeScript-based HTTP server that controls the ShotExpress train via REST API endpoints.
+Next.js UI that publishes MQTT commands to the train and tracks responses in real time.
 
 ## Getting Started
 
 ### Prerequisites
-- Node.js (v16 or higher)
-- npm or yarn
+
+- Node.js version pinned via `.nvmrc`
+- `pnpm` (enable via `corepack enable` if needed)
 
 ### Installation
 
-1. Navigate to the webserver directory:
-   ```bash
-   cd webserver
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Build the project:
-   ```bash
-   npm run build
-   ```
-
-4. Start the server:
-   ```bash
-   npm start
-   ```
-
-### Development
-
-For development with auto-compilation:
 ```bash
-npm run watch
+cd webserver
+nvm install
+nvm use
+pnpm install
 ```
 
-## API Endpoints
+### Required environment variables
 
-### GET `/train-status`
-Returns the current train status and commands. This endpoint is designed to be polled by the train's ESP microcontroller.
-
-**Response:**
-```json
-{
-  "success": true,
-  "data": {
-    "speed": 0,
-    "direction": "stopped",
-    "command": "none",
-    "timestamp": 1699459200000
-  }
-}
-```
-
-### POST `/control-train`
-Controls the train by setting speed and commands.
-
-**Request Body:**
-```json
-{
-  "command": "move",
-  "speed": 128
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "data": {
-    "speed": 128,
-    "direction": "forward",
-    "command": "move",
-    "timestamp": 1699459200000
-  }
-}
-```
-
-### GET `/health`
-Health check endpoint.
-
-**Response:**
-```json
-{
-  "success": true,
-  "message": "ShotExpress Webserver is running",
-  "timestamp": "2024-11-08T10:00:00.000Z"
-}
-```
-
-## Train Integration
-
-The train's ESP microcontroller should periodically poll the `/train-status` endpoint to receive commands. The expected polling interval is configurable but typically ranges from 100ms to 1000ms depending on responsiveness requirements.
-
-## Project Structure
+Create `.env.local` (see `.env.local.example`) with at least:
 
 ```
-webserver/
-├── src/
-│   └── index.ts          # Main server entry point
-├── dist/                 # Compiled JavaScript output
-├── package.json          # Dependencies and scripts
-├── tsconfig.json         # TypeScript configuration
-└── README.md             # This file
+NEXT_PUBLIC_MQTT_URL=mqtt://localhost:1883    # or ws:// for browser clients
+NEXT_PUBLIC_MQTT_USER=shotexpress             # optional
+NEXT_PUBLIC_MQTT_PASS=secret                  # optional
 ```
+
+For the simulator (`fake_express`) you can override with:
+
+```
+FAKE_EXPRESS_MQTT_URL=mqtt://localhost:1883
+FAKE_EXPRESS_MQTT_USER=shotexpress
+FAKE_EXPRESS_MQTT_PASS=secret
+```
+
+### Run the web UI
+
+```bash
+pnpm dev
+```
+
+Open http://localhost:3000 to dispatch the train. The page shows:
+
+- **Send train to Raucherecke** button publishing a spec-compliant `move_to` command.
+- Live heartbeat (MQTT `shotexpress/status`) showing current state and uptime.
+- Command lifecycle feed derived from `shotexpress/event/exec` events.
+
+### Run the fake train simulator
+
+```bash
+pnpm fake:train
+```
+
+This starts `lib/fakeExpress.ts`, which consumes `shotexpress/command`, simulates a run to the Raucherecke, publishes status heartbeats, and emits lifecycle events.
+
+Stop with `Ctrl+C`.

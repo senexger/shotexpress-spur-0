@@ -33,8 +33,8 @@ Events end commandos have these `common_envelope` fields:
 
 ```json
 {
-  "producer": "server",          // or "train"
   "msg_id": "550e8400-e29b-11d4-a716-446655440000",         // str, unique per message UUID-4
+  "cmd_id": "650e8400-e29b-11d4-a716-446655440001",         // str, unique per command UUID-4
   "seq": 231,                    // uint32, per-producer monotonic
   "ts_ms": 1762593665123         // int64 unix epoch ms
 }
@@ -147,6 +147,5 @@ Todo: Write this.
 
 ### Webserver Setup
 1. Navigate to the `webserver/` directory
-2. Run `pnpm install` to install dependencies
-3. Run `npm run build` to compile TypeScript
-4. Run `npm run dev` to start the development server
+1. Run `pnpm fake:train` to start the train simulation
+1. Run `pnpm run dev` to start the development server
