@@ -1,37 +1,59 @@
-# ShotExpress Webserver
+# ShotExpress Webserver (Next.js)
 
-A TypeScript-based HTTP server that controls the ShotExpress train via REST API endpoints.
+Next.js UI that publishes MQTT commands to the train and tracks responses in real time.
 
 ## Getting Started
 
 ### Prerequisites
-- nvm (project Node version is pinned via `.nvmrc`)
-- pnpm
 
-### Development Quick-start
+- Node.js version pinned via `.nvmrc`
+- `pnpm` (enable via `corepack enable` if needed)
 
-1. Navigate to the webserver directory:
-   ```bash
-   cd webserver
-   ```
+### Installation
 
-2. Align your Node.js version with `.nvmrc`:
-  ```bash
-  nvm install
-  nvm use
-  ```
+```bash
+cd webserver
+nvm install
+nvm use
+pnpm install
+```
 
-3. Install dependencies:
-   ```bash
-  pnpm install
-   ```
+### Required environment variables
 
-4. Build the project:
-   ```bash
-  pnpm build
-   ```
+Create `.env.local` (see `.env.local.example`) with at least:
 
-5. Start the server:
-   ```bash
-  pnpm dev
-   ```
+```
+NEXT_PUBLIC_MQTT_URL=mqtt://localhost:1883    # or ws:// for browser clients
+NEXT_PUBLIC_MQTT_USER=shotexpress             # optional
+NEXT_PUBLIC_MQTT_PASS=secret                  # optional
+```
+
+For the simulator (`fake_express`) you can override with:
+
+```
+FAKE_EXPRESS_MQTT_URL=mqtt://localhost:1883
+FAKE_EXPRESS_MQTT_USER=shotexpress
+FAKE_EXPRESS_MQTT_PASS=secret
+```
+
+### Run the web UI
+
+```bash
+pnpm dev
+```
+
+Open http://localhost:3000 to dispatch the train. The page shows:
+
+- **Send train to Raucherecke** button publishing a spec-compliant `move_to` command.
+- Live heartbeat (MQTT `shotexpress/status`) showing current state and uptime.
+- Command lifecycle feed derived from `shotexpress/event/exec` events.
+
+### Run the fake train simulator
+
+```bash
+pnpm fake:train
+```
+
+This starts `lib/fakeExpress.ts`, which consumes `shotexpress/command`, simulates a run to the Raucherecke, publishes status heartbeats, and emits lifecycle events.
+
+Stop with `Ctrl+C`.
