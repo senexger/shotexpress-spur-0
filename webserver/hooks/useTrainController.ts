@@ -122,12 +122,7 @@ export function useTrainController(): ControllerState {
       direction: "forward",
       expected_tags: ["tag_02", "tag_03", "tag_04", "tag_05", "tag_06"],
       stop_on_tag: "tag_07",
-      offline_plan: {
-        approach_slowdown_ms: 2_000,
-        max_run_ms_without_tag: 7_000,
-        crawl_speed: 0.15,
-        dwell_ms: 1_500,
-      },
+      max_run_ms_without_tag: 7_000,
     };
 
     const command = createMoveCommand(envelope, params, 60_000);

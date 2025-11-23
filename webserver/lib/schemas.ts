@@ -15,11 +15,6 @@ export const execAcceptedSchema = z.object({
     exec_type: z.literal("accepted"),
 });
 
-export const execStartedSchema = z.object({
-    ...envelopeSchema.shape,
-    exec_type: z.literal("started"),
-});
-
 export const execProgressSchema = z.object({
     ...envelopeSchema.shape,
     exec_type: z.literal("progress"),
@@ -56,7 +51,6 @@ export const execExpiredSchema = z.object({
 
 export const eventExecSchema = z.discriminatedUnion("exec_type", [
     execAcceptedSchema,
-    execStartedSchema,
     execProgressSchema,
     execCompletedSchema,
     execFailedSchema,
@@ -90,20 +84,13 @@ export type StatusMessage = z.infer<typeof statusSchema>;
 
 // Server Messages
 
-export const offlinePlanSchema = z.object({
-    approach_slowdown_ms: z.number().nonnegative(),
-    max_run_ms_without_tag: z.number().nonnegative(),
-    crawl_speed: z.number().min(0).max(1),
-    dwell_ms: z.number().nonnegative()
-})
-
 export const moveCommandParametersSchema = z.object({
     target: z.enum(["bar", "schachbrett", "forgot_name", "raucherecke"]),
     speed: z.number().min(0).max(1),
     direction: z.enum(["forward", "reverse"]),
     expected_tags: z.array(z.string()),
     stop_on_tag: z.string(),
-    offline_plan: offlinePlanSchema
+    max_run_ms_without_tag: z.number().nonnegative(),
 });
 
 export const stopCommandSchema = z.object({
@@ -145,7 +132,6 @@ export type PublishableMessage = {
 
 export type CommandType = z.infer<typeof commandSchema>["cmd_type"];
 export type Envelope = z.infer<typeof envelopeSchema>;
-export type OfflinePlan = z.infer<typeof offlinePlanSchema>;
 export type MoveCommandParameters = z.infer<typeof moveCommandParametersSchema>;
 export type StopCommand = z.infer<typeof stopCommandSchema>;
 export type WaitForLoadCommand = z.infer<typeof waitForLoadCommandSchema>;

@@ -54,22 +54,13 @@ Topic: `shotexpress/command` (QoS 1, not retained, with MQTT message_expiry set)
     "direction": "forward",                // "forward" | "reverse"
     "expected_tags": ["tag_03","tag_04","tag_05"],
     "stop_on_tag": "tag_06",
-    "offline_plan": {
-      "approach_slowdown_ms": 2000,        // begin crawl this long after first expected tag miss
-      "max_run_ms_without_tag": 7000,      // hard stop if no tag for this long
-      "crawl_speed": 0.15,                 // speed used while searching for tag
-      "dwell_ms": 1500                     // stop dwell after reaching stop_on_tag
-    },
+    "max_run_ms_without_tag": 7000,
     "ttl_ms": 15000                        // discard command if not started in time
   }
 }
 ```
 
-If the train looses connection to the MQTT broker, then it falls back to the `offline_plan`:
-- If the next `expected_tag` has been missed, the train slows down ("crawls") at `crawl_speed` after `approach_slowdown_ms` has passed.
-- If the train doesn't read an RFID tag for `max_run_ms_without_tag`, it stops and `IDLE`s until it receives a new server message.
-- If the train does contine reading RFID tags, it continues driving, until it reads the final `stop_on_tag`.
-- It then waits for `dwell_ms` before it goes to `IDLE` state.
+If the train looses connection to the MQTT broker and doesn't read an RFID tag for `max_run_ms_without_tag`, it stops and `IDLE`s until it receives a new server message.
 
 
 ### train → server: event/exec
@@ -115,10 +106,10 @@ Normal states running from the bar to the Raucherecke: `IDLE → RUNNING → APP
 
 ```
 on command(move_to p):
-  if now > command_ts + ttl: ignore  # each webserver command has a ttl. If that expires, fall back to offline_plan
+  if now > command_ts + ttl: ignore  # each webserver command has a ttl. If that expires, fall back to max_runtime_ms_without_tag
   ack_id = msg_id
   set speed = p.speed, dir = p.direction
-  deadline = now + p.offline_plan.max_run_ms_without_tag
+  deadline = now + p.max_runtime_ms_without_tag
   while running:
     if tag in p.stop_on_tag_set: stop(); wait p.offline_plan.dwell_ms; publish exec:completed; break
     if now > deadline: stop(); error=RFID_TIMEOUT; publish exec:failed; break

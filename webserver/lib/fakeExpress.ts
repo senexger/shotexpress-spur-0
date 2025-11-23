@@ -145,14 +145,6 @@ class FakeExpressRuntime {
     this.queue(() => {
       this.publishExec({
         ...this.envelopeFactory(command.cmd_id),
-        exec_type: "started",
-      });
-      this.updateState("RUNNING");
-    }, 300);
-
-    this.queue(() => {
-      this.publishExec({
-        ...this.envelopeFactory(command.cmd_id),
         exec_type: "progress",
         direction: "forward",  // hardcode for now
         progress: {
@@ -186,7 +178,7 @@ class FakeExpressRuntime {
     this.queue(() => {
       this.updateState("IDLE");
       this.currentCommandId = '';
-    }, 5_600 + command.params.offline_plan.dwell_ms);
+    }, 5_600);
   }
 
   private publishExec(execEvent: ExecEvent) {
