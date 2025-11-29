@@ -1,121 +1,123 @@
-#include <AccelStepper.h>
-#include <MQTT.h>
-#include <WiFi.h>
-#include <HardwareSerial.h>
-
-// Define Step/Dir pins
 #define STEP_PIN 19
-#define DIR_PIN 18
-#define EN_PIN 4
+#define DIR_PIN  18
+#define EN_PIN   4
 
-#define FAR_DISTANCE 7000000
+#define WIFI_RETRY_INTERVAL 5000
+#define MQTT_PUBLISH_INTERVAL 1000
 
-// 0 - stop
-// 1 - forward
-// 2 - backward
-int state = 0;
+// #include <Arduino.h>
+#include <WiFi.h>
+#include <MQTT.h>
+#include <FastAccelStepper.h>
 
-const char ssid[] = "dachboden";
-const char pass[] = "epicattic";
-// const char ssid[] = "Incubator";
-// const char pass[] = "Fl4mongo";
-
-WiFiClient net;
-MQTTClient mqttClient;
+const char ssid[] = "Incubator";
+const char pass[] = "Fl4mongo";
 
 const char mqttClientID[] = "StupidStepper";
 const char mqttClientUsername[] = "admin";
 const char mqttClientPassword[] = "123";
+const char mqttHost[] = "192.168.16.127";
+const char mqttSubTopic[] = "shotexpress/command";
 
-// (1 : Driver + Step + Dir)
-AccelStepper stepper(1, STEP_PIN, DIR_PIN);
+WiFiClient net;
+MQTTClient mqttClient;
 
-void connect() {
-  // Serial.println("checking wifi...");
-  // while (WiFi.status() != WL_CONNECTED) {
-  //   Serial.print(".");
-  //   delay(1000);
-  // }
+FastAccelStepperEngine engine;
+FastAccelStepper *stepper = NULL;
 
-  // Serial.print("connect mqtt: ");
-  while (!mqttClient.connect(mqttClientID, mqttClientUsername, mqttClientPassword)) {
-      // Serial.print(".");
-      // delay(1000);
-      break;
-  }
+unsigned long lastWifiRetry = 0;
+unsigned long lastPublishTime = 0;
 
-  // Serial.println("Mqtt connected");
-  mqttClient.subscribe("shotexpress/command");
-
-}
+int currentState = 0; // 0 - stop, 1 - backward, 2 - forward
 
 void messageReceived(String &topic, String &payload) {
   Serial.println("Incoming: " + topic + " - " + payload);
 
-  // Convert payload to integer (0, 1, or 2)
   int newCommand = payload.toInt();
 
-  // Only react if the command actually changed
-  if (newCommand != state) {
-    state = newCommand;
+  if (newCommand != currentState) {
+    currentState = newCommand;
 
-    // -- STATE MACHINE --
-    if (state == 2) {
-      // FORWARD
-      digitalWrite(EN_PIN, LOW); // Enable motor driver
-      stepper.moveTo(FAR_DISTANCE); // Go "forever" forward
+    switch (currentState) {
+      case 2:
+        stepper->runForward();
+        break;
+      case 1:
+        stepper->runBackward();
+        break;
+      case 0:
+        stepper->stopMove();
+        break;
+      default:
+        Serial.println("Invalid command");
+        break;
     }
-    else if (state == 1) {
-      // BACKWARD
-      digitalWrite(EN_PIN, LOW); // Enable motor driver
-      stepper.moveTo(-FAR_DISTANCE); // Go "forever" backward
+  }
+}
+
+// Non-blocking connection manager
+void handleConnection() {
+  unsigned long currentMillis = millis();
+
+  // 1. Check WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    if (currentMillis - lastWifiRetry > WIFI_RETRY_INTERVAL) {
+      Serial.print("Connecting to WiFi...");
+      // WiFi.disconnect(); // Optional: sometimes helps to reset
+      WiFi.begin(ssid, pass);
+      lastWifiRetry = currentMillis;
     }
-    else if (state == 0) {
-      // STOP
-      // stepper.stop() calculates a smooth deceleration to stop
-      stepper.stop();
+    return;
+  }
+
+  if (!mqttClient.connected()) {
+    if (currentMillis - lastWifiRetry > WIFI_RETRY_INTERVAL) {
+      Serial.print("Connecting MQTT...");
+
+      if (mqttClient.connect(mqttClientID, mqttClientUsername, mqttClientPassword)) {
+        Serial.println("\nMQTT Connected!");
+        mqttClient.subscribe(mqttSubTopic);
+      } else {
+        Serial.print(".");
+      }
+      lastWifiRetry = currentMillis;
     }
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(EN_PIN, OUTPUT);
-  digitalWrite(EN_PIN, HIGH);
+  Serial.println("Booting...");
 
-  Serial.println("Booot");
-  Serial.println("Connecting to wifi:");
-  WiFi.begin(ssid, pass);
+  engine.init();
+  stepper = engine.stepperConnectToPin(STEP_PIN);
 
-  Serial.println("WiFi connected");
+  if (stepper) {
+    stepper->setDirectionPin(DIR_PIN);
+    stepper->setEnablePin(EN_PIN);
+    stepper->setAutoEnable(true);
 
-  stepper.setMaxSpeed(8000);      // Target Speed, steps per second (Try increasing this later!)
-  stepper.setAcceleration(1000);   // Acceleration (Lower = smoother, Higher = snappier)
-
-  mqttClient.begin("192.168.16.127", net);
-  mqttClient.onMessage(messageReceived);
-  connect();
-  delay(5000);
-}
-
-
-unsigned long lastPublishTime = 0;
-
-void loop() {
-  mqttClient.loop();
-  if (!mqttClient.connected()) {
-    connect();
+    // Ramp up settings
+    stepper->setSpeedInHz(8000);
+    stepper->setAcceleration(1000);
   }
 
-  if (millis() - lastPublishTime > 1000) {
-      mqttClient.publish("topic/to/publish/to", "Alive");
+  WiFi.begin(ssid, pass);
+
+  mqttClient.begin(mqttHost, net);
+  mqttClient.onMessage(messageReceived);
+}
+
+// Accelstepper runs in the background.
+void loop() {
+  handleConnection();
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+
+    if (millis() - lastPublishTime > MQTT_PUBLISH_INTERVAL) {
+      mqttClient.publish("shotexpress/status", "Alive");
       lastPublishTime = millis();
     }
-
-  stepper.run();
-
-    // Optional: Completely cut power if stopped and destination reached
-    if (state == 0 && stepper.distanceToGo() == 0) {
-       digitalWrite(EN_PIN, HIGH); // Disable driver (saves power/heat)
-    }
+  }
 }
