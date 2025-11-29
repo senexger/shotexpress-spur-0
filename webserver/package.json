@@ -4,7 +4,7 @@
   "description": "Next.js control interface for the ShotExpress train via MQTT",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "next dev --hostname 0.0.0.0 --port 3000",
+    "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "fake:train": "tsx ./scripts/fakeExpress.ts",
