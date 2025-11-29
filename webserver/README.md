@@ -23,9 +23,9 @@ pnpm install
 Create `.env.local` (see `.env.local.example`) with at least:
 
 ```
-NEXT_PUBLIC_MQTT_URL=mqtt://localhost:1883    # or ws:// for browser clients
-NEXT_PUBLIC_MQTT_USER=shotexpress             # optional
-NEXT_PUBLIC_MQTT_PASS=secret                  # optional
+MQTT_URL=mqtt://localhost:1883           # broker URL (use wss://... if required by the broker)
+MQTT_USERNAME=shotexpress                # optional
+MQTT_PASSWORD=secret                     # optional
 ```
 
 For the simulator (`fake_express`) you can override with:
