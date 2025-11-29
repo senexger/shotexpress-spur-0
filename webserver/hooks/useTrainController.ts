@@ -4,10 +4,7 @@ import type { ConnectionState, ControllerSnapshot } from "../lib/controllerTypes
 
 export type ControllerState = {
   connection: ConnectionState;
-  lastStatus: StatusMessage | null;
-  events: ExecEvent[];
-  sendTrainToRaucherecke: () => void;
-  isBusy: boolean;
+  sendCommand: (command: 0 | 1 | 2) => void;
   error: string | null;
 };
 
@@ -25,10 +22,7 @@ const STREAM_URL = "/api/train/stream";
 
 export function useTrainController(): ControllerState {
   const [connection, setConnection] = useState<ConnectionState>("connecting");
-  const [lastStatus, setLastStatus] = useState<StatusMessage | null>(null);
-  const [events, setEvents] = useState<ExecEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [isBusy, setIsBusy] = useState<boolean>(false);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const isMountedRef = useRef(true);
@@ -161,10 +155,7 @@ export function useTrainController(): ControllerState {
 
   return {
     connection,
-    lastStatus,
-    events,
-    sendTrainToRaucherecke,
-    isBusy,
+    sendCommand,
     error,
   };
 }
