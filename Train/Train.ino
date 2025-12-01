@@ -1,10 +1,12 @@
 #define STEP_PIN 19
 #define DIR_PIN  18
+#define EN_PIN   16
 
 #define WIFI_RETRY_INTERVAL 5000
 #define MQTT_PUBLISH_INTERVAL 1000
+#define MAX_SPEED 12000
+#define ACCELERATION 1000
 
-// #include <Arduino.h>
 #include <WiFi.h>
 #include <MQTT.h>
 #include <FastAccelStepper.h>
@@ -24,7 +26,8 @@ const char mqttSubTopic[] = "shotexpress/command";
 
 WiFiClient net;
 MQTTClient mqttClient;
- WiFiServer telnetServer(23);
+
+WiFiServer telnetServer(23);
 WiFiClient telnetClient;
 
 FastAccelStepperEngine engine;
@@ -90,7 +93,7 @@ void setupOTA() {
     else // U_SPIFFS
       type = "filesystem";
 
-    if (stepper) { // SAFETY
+    if (stepper) {
       stepper->forceStop();
     }
     debugPrintln("Start updating " + type);
@@ -140,7 +143,6 @@ void handleConnection() {
   if (WiFi.status() != WL_CONNECTED) {
     if (currentMillis - lastWifiRetry > WIFI_RETRY_INTERVAL) {
       Serial.print("Connecting to WiFi...");
-      WiFi.mode(WIFI_STA);
       WiFi.begin(ssid, pass);
       lastWifiRetry = currentMillis;
     }
@@ -177,8 +179,8 @@ void setup() {
     stepper->setDirectionPin(DIR_PIN);
     stepper->setEnablePin(EN_PIN);
     stepper->setAutoEnable(true);
-    stepper->setSpeedInHz(8000);
-    stepper->setAcceleration(1000);
+    stepper->setSpeedInHz(MAX_SPEED);
+    stepper->setAcceleration(ACCELERATION);
   }
 
   WiFi.mode(WIFI_STA);
