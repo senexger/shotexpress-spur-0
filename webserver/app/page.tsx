@@ -1,11 +1,12 @@
+import React from "react";
 import { TrainDashboard } from "../components/TrainDashboard";
 
 export default function Page() {
   return (
-    <main style={{ maxWidth: 720, margin: "2.5rem auto", fontFamily: "system-ui, sans-serif", padding: "0 1rem" }}>
-      <header style={{ marginBottom: "1.5rem" }}>
-        <h1 style={{ fontSize: "2rem", fontWeight: 600, margin: 0 }}>ShotExpress Control</h1>
-        <p style={{ color: "#475569", marginTop: "0.5rem", fontSize: "0.95rem" }}>
+    <main className="control-page">
+      <header className="page-header">
+        <h1 className="page-title">ShotExpress Control</h1>
+        <p className="page-subtitle">
           Dispatch the train to the Raucherecke and track its progress in real time.
         </p>
       </header>
