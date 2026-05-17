@@ -1,49 +1,41 @@
-// TODO: Change #define to const
-#define STEP_PIN 18
-#define DIR_PIN  19
-#define EN_PIN   5
-
-#define WIFI_RETRY_INTERVAL 5000
-#define MQTT_PUBLISH_INTERVAL 1000
-#define RFID_CHECK_INTERVAL 250 // TODO: minor tweeking needed?
-unsigned long lastRfidChecktime = 0;
-#define MAX_SPEED 12000
-#define ACCELERATION 1000
-
-
 #include <SPI.h>
-#include <MFRC522.h>
-
-const int RST_PIN = 22;
-const int SS_PIN = 15;
-const int SCK_PIN = 14;
-const int MISO_PIN = 13;
-const int MOSI_PIN = 12;
-
-MFRC522 mfrc522(SS_PIN, RST_PIN);
-
-String rfidBuffer = "";
-String lastReadTag = "";
-
 #include <WiFi.h>
 #include <MQTT.h>
 #include <FastAccelStepper.h>
 #include <SoftwareSerial.h>
-
-#include <ESPmDNS.h>
 #include <WiFiUdp.h>
+#include <MFRC522.h>
+#include <ESPmDNS.h>
+#include "credentials.h"
 // #include <ArduinoOTA.h>
 
-const char ssid[] = "Incubator";
-const char pass[] = "Fl4mongo";
+constexpr int STEP_PIN = 2;
+constexpr int DIR_PIN =  19;
+constexpr int EN_PIN =   5;
+constexpr int RST_PIN = 22;
+constexpr int SS_PIN = 15;
+constexpr int SCK_PIN = 14;
+constexpr int MISO_PIN = 13;
+constexpr int MOSI_PIN = 12;
 
-const char mqttClientID[] = "StupidStepper"; // TODO rename this to ... train?
-const char mqttClientUsername[] = "admin";
-const char mqttClientPassword[] = "123";
-const char mqttHost[] = "192.168.16.127";
-const char mqttSubTopic[] = "shotexpress/command";
+constexpr unsigned long WIFI_RETRY_INTERVAL = 5000;
+constexpr unsigned long MQTT_PUBLISH_INTERVAL = 1000;
+constexpr unsigned long RFID_CHECK_INTERVAL = 250;
+constexpr unsigned long MAX_SPEED = 12000;
+constexpr unsigned long ACCELERATION = 1000;
 
-String text;
+constexpr const char* ssid = SECRET_PASS;
+constexpr const char* pass = SECRET_SSID;
+constexpr const char* mqttClientID = "StupidStepper"; // TODO rename?
+constexpr const char* mqttClientUsername = "admin";
+constexpr const char* mqttClientPassword = "123";
+constexpr const char* mqttHost = "192.168.16.127"; // My Laptop for now
+constexpr const char* mqttSubTopic = "shotexpress/command";
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+unsigned long lastRfidChecktime = 0;
+String rfidBuffer = "";
+String lastReadTag = "";
 
 WiFiClient net;
 MQTTClient mqttClient;
@@ -58,7 +50,9 @@ unsigned long lastWifiRetry = 0;
 unsigned long lastPublishTime = 0;
 unsigned long lastRFIDTime = 0;
 
-int currentState = 0; // 0 - stop, 1 - backward, 2 - forward
+// Train States
+// 0 - stop, 1 - backward, 2 - forward
+int currentState = 0;
 
 void debugPrint(String msg) {
   Serial.print(msg);
