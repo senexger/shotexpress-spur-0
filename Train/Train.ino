@@ -1,121 +1,247 @@
-#include <AccelStepper.h>
-#include <MQTT.h>
+#include <SPI.h>
 #include <WiFi.h>
-#include <HardwareSerial.h>
+#include <MQTT.h>
+#include <FastAccelStepper.h>
+#include <SoftwareSerial.h>
+#include <WiFiUdp.h>
+#include <MFRC522.h>
+#include <ESPmDNS.h>
+#include "credentials.h"
+// #include <ArduinoOTA.h>
 
-// Define Step/Dir pins
-#define STEP_PIN 19
-#define DIR_PIN 18
-#define EN_PIN 4
+constexpr int STEP_PIN = 2;
+constexpr int DIR_PIN =  19;
+constexpr int EN_PIN =   5;
+constexpr int RST_PIN = 22;
+constexpr int SS_PIN = 15;
+constexpr int SCK_PIN = 14;
+constexpr int MISO_PIN = 13;
+constexpr int MOSI_PIN = 12;
 
-#define FAR_DISTANCE 7000000
+constexpr unsigned long WIFI_RETRY_INTERVAL = 5000;
+constexpr unsigned long MQTT_PUBLISH_INTERVAL = 1000;
+constexpr unsigned long RFID_CHECK_INTERVAL = 250;
+constexpr unsigned long MAX_SPEED = 12000;
+constexpr unsigned long ACCELERATION = 1000;
 
-// 0 - stop
-// 1 - forward
-// 2 - backward
-int state = 0;
+constexpr const char* ssid = SECRET_PASS;
+constexpr const char* pass = SECRET_SSID;
+constexpr const char* mqttClientID = "StupidStepper"; // TODO rename?
+constexpr const char* mqttClientUsername = "admin";
+constexpr const char* mqttClientPassword = "123";
+constexpr const char* mqttHost = "192.168.16.127"; // My Laptop for now
+constexpr const char* mqttSubTopic = "shotexpress/command";
 
-const char ssid[] = "dachboden";
-const char pass[] = "epicattic";
-// const char ssid[] = "Incubator";
-// const char pass[] = "Fl4mongo";
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+unsigned long lastRfidChecktime = 0;
+String rfidBuffer = "";
+String lastReadTag = "";
 
 WiFiClient net;
 MQTTClient mqttClient;
 
-const char mqttClientID[] = "StupidStepper";
-const char mqttClientUsername[] = "admin";
-const char mqttClientPassword[] = "123";
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
 
-// (1 : Driver + Step + Dir)
-AccelStepper stepper(1, STEP_PIN, DIR_PIN);
+FastAccelStepperEngine engine;
+FastAccelStepper *stepper = NULL;
 
-void connect() {
-  // Serial.println("checking wifi...");
-  // while (WiFi.status() != WL_CONNECTED) {
-  //   Serial.print(".");
-  //   delay(1000);
-  // }
+unsigned long lastWifiRetry = 0;
+unsigned long lastPublishTime = 0;
+unsigned long lastRFIDTime = 0;
 
-  // Serial.print("connect mqtt: ");
-  while (!mqttClient.connect(mqttClientID, mqttClientUsername, mqttClientPassword)) {
-      // Serial.print(".");
-      // delay(1000);
-      break;
+// Train States
+// 0 - stop, 1 - backward, 2 - forward
+int currentState = 0;
+
+void debugPrint(String msg) {
+  Serial.print(msg);
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.print(msg);
   }
-
-  // Serial.println("Mqtt connected");
-  mqttClient.subscribe("shotexpress/command");
-
 }
 
-void messageReceived(String &topic, String &payload) {
-  Serial.println("Incoming: " + topic + " - " + payload);
+void debugPrintln(String msg) {
+  Serial.println(msg);
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.println(msg);
+  }
+}
+// ----------------------------------------------
 
-  // Convert payload to integer (0, 1, or 2)
+void messageReceived(String &topic, String &payload) {
+  debugPrintln("Incoming: " + topic + " - " + payload);
+
   int newCommand = payload.toInt();
 
-  // Only react if the command actually changed
-  if (newCommand != state) {
-    state = newCommand;
+  if (newCommand != currentState) {
+    currentState = newCommand;
 
-    // -- STATE MACHINE --
-    if (state == 2) {
-      // FORWARD
-      digitalWrite(EN_PIN, LOW); // Enable motor driver
-      stepper.moveTo(FAR_DISTANCE); // Go "forever" forward
+    switch (currentState) {
+      case 2:
+        stepper->runBackward();
+        debugPrintln("Status: Run Backward");
+        break;
+      case 1:
+        stepper->move(1000);
+        debugPrintln("Status: Run Backward");
+        break;
+      case 0:
+        stepper->stopMove();
+        debugPrintln("Status: Stop");
+        break;
+      default:
+        debugPrintln("Error: Invalid command");
+        break;
     }
-    else if (state == 1) {
-      // BACKWARD
-      digitalWrite(EN_PIN, LOW); // Enable motor driver
-      stepper.moveTo(-FAR_DISTANCE); // Go "forever" backward
+  }
+}
+
+// void setupOTA() {
+//   ArduinoOTA.setHostname(mqttClientID); // Hostname for port scanning
+
+//   ArduinoOTA.onStart([]() {
+//     String type;
+//     if (ArduinoOTA.getCommand() == U_FLASH)
+//       type = "sketch";
+//     else // U_SPIFFS
+//       type = "filesystem";
+
+//     if (stepper) {
+//       stepper->forceStop();
+//     }
+//     debugPrintln("Start updating " + type);
+//   });
+
+//   ArduinoOTA.onEnd([]() {
+//     debugPrintln("\nEnd");
+//   });
+
+//   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+//     // Avoid spamming telnet during progress, usually too fast
+//     // Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+//   });
+
+//   ArduinoOTA.onError([](ota_error_t error) {
+//     debugPrint("Error: ");
+//     if (error == OTA_AUTH_ERROR) debugPrintln("Auth Failed");
+//     else if (error == OTA_BEGIN_ERROR) debugPrintln("Begin Failed");
+//     else if (error == OTA_CONNECT_ERROR) debugPrintln("Connect Failed");
+//     else if (error == OTA_RECEIVE_ERROR) debugPrintln("Receive Failed");
+//     else if (error == OTA_END_ERROR) debugPrintln("End Failed");
+//   });
+
+//   ArduinoOTA.begin();
+// }
+
+void handleTelnet() {
+  // Check for new clients
+  if (telnetServer.hasClient()) {
+    if (!telnetClient || !telnetClient.connected()) {
+      if (telnetClient) telnetClient.stop(); // Clean up old
+      telnetClient = telnetServer.available(); // Accept new
+      telnetClient.println("Connected to StupidStepper Debug Console");
+      debugPrintln("New Telnet Client Connected");
+    } else {
+      // Reject if already connected
+      WiFiClient serverClient = telnetServer.available();
+      serverClient.stop();
+      debugPrintln("Rejected extra Telnet connection");
     }
-    else if (state == 0) {
-      // STOP
-      // stepper.stop() calculates a smooth deceleration to stop
-      stepper.stop();
+  }
+}
+
+void handleConnection() {
+  unsigned long currentMillis = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (currentMillis - lastWifiRetry > WIFI_RETRY_INTERVAL) {
+      Serial.print("Connecting to WiFi...");
+      WiFi.begin(ssid, pass);
+      lastWifiRetry = currentMillis;
+    }
+    return;
+  }
+
+  // ArduinoOTA.handle();
+
+  handleTelnet();
+
+  if (!mqttClient.connected()) {
+    if (currentMillis - lastWifiRetry > WIFI_RETRY_INTERVAL) {
+      debugPrintln("Connecting MQTT...");
+
+      if (mqttClient.connect(mqttClientID, mqttClientUsername, mqttClientPassword)) {
+        debugPrintln("MQTT Connected!");
+        mqttClient.subscribe(mqttSubTopic);
+      } else {
+        debugPrint(".");
+      }
+      lastWifiRetry = currentMillis;
     }
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(EN_PIN, OUTPUT);
-  digitalWrite(EN_PIN, HIGH);
+  Serial.println("Booting...");
 
-  Serial.println("Booot");
-  Serial.println("Connecting to wifi:");
-  WiFi.begin(ssid, pass);
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+  mfrc522.PCD_Init();
 
-  Serial.println("WiFi connected");
+  engine.init();
+  stepper = engine.stepperConnectToPin(STEP_PIN);
 
-  stepper.setMaxSpeed(8000);      // Target Speed, steps per second (Try increasing this later!)
-  stepper.setAcceleration(1000);   // Acceleration (Lower = smoother, Higher = snappier)
-
-  mqttClient.begin("192.168.16.127", net);
-  mqttClient.onMessage(messageReceived);
-  connect();
-  delay(5000);
-}
-
-
-unsigned long lastPublishTime = 0;
-
-void loop() {
-  mqttClient.loop();
-  if (!mqttClient.connected()) {
-    connect();
+  if (stepper) {
+    stepper->setDirectionPin(DIR_PIN);
+    stepper->setEnablePin(EN_PIN);
+    stepper->setAutoEnable(true);
+    stepper->setSpeedInHz(MAX_SPEED);
+    stepper->setAcceleration(ACCELERATION);
   }
 
-  if (millis() - lastPublishTime > 1000) {
-      mqttClient.publish("topic/to/publish/to", "Alive");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+
+  telnetServer.begin();
+  telnetServer.setNoDelay(true); // Faster transmission
+
+  // setupOTA();
+
+  mqttClient.begin(mqttHost, net);
+  mqttClient.onMessage(messageReceived);
+}
+
+void loop() {
+  handleConnection();
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+
+    if (millis() - lastPublishTime > MQTT_PUBLISH_INTERVAL) {
+      mqttClient.publish("shotexpress/status", "Alive");
       lastPublishTime = millis();
     }
+  }
 
-  stepper.run();
-
-    // Optional: Completely cut power if stopped and destination reached
-    if (state == 0 && stepper.distanceToGo() == 0) {
-       digitalWrite(EN_PIN, HIGH); // Disable driver (saves power/heat)
+  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+    String uidString = "";
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+      if (mfrc522.uid.uidByte[i] < 0x10) uidString += "0";
+      uidString += String(mfrc522.uid.uidByte[i], HEX);
     }
+    uidString.toUpperCase();
+    lastReadTag = uidString;
+
+    mfrc522.PICC_HaltA(); 
+  }
+
+  if (millis() - lastRfidChecktime >= RFID_CHECK_INTERVAL) {
+    lastRfidChecktime = millis();
+
+    if (lastReadTag != "") {
+      Serial.println("Card ID : " + lastReadTag);
+      lastReadTag = "";
+    }
+  }
 }
