@@ -16,6 +16,9 @@ mqtt-broker/pwfile
 mqtt-broker/.env
 mqtt-broker/data/mosquitto.db
 
+# Rust workspace
+/target
+
 # General ignores
 .DS_Store
 *.log

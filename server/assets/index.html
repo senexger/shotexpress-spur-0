@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ShotExpress Control</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="control-page">
+    <header class="page-header">
+      <h1 class="page-title">ShotExpress Control</h1>
+      <p class="page-subtitle">
+        Dispatch the train to the Raucherecke and track its progress in real time.
+      </p>
+    </header>
+
+    <div class="dashboard">
+      <section class="card">
+        <h2 class="sectionTitle">Train Control</h2>
+        <p class="mutedText">Connection: <span id="connection-label">Connecting</span></p>
+        <p id="control-error" class="warningBox sectionError" hidden></p>
+        <button id="send-button" class="button" disabled>Send train to Raucherecke</button>
+      </section>
+
+      <section class="card">
+        <h2 class="sectionTitle">Manual Control</h2>
+        <p class="mutedText">
+          Raw firmware commands (0/1/2). The firmware ignores repeated commands — press Stop before
+          moving steps again.
+        </p>
+        <p id="manual-error" class="warningBox sectionError" hidden></p>
+        <div class="manualButtonRow">
+          <button class="button" data-action="steps">Move 1000 steps</button>
+          <button class="button" data-action="run">Run continuous</button>
+          <button class="button" data-action="stop">Stop</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="sectionTitle">Live Status</h2>
+        <p id="status-empty" class="mutedText">No status messages yet.</p>
+        <dl id="status-grid" class="statusGrid" hidden>
+          <div>
+            <dt class="statusTerm">State</dt>
+            <dd id="status-state" class="statusValue"></dd>
+          </div>
+          <div>
+            <dt class="statusTerm">Battery</dt>
+            <dd id="status-battery" class="statusValue"></dd>
+          </div>
+          <div>
+            <dt class="statusTerm">Status uptime</dt>
+            <dd id="status-uptime" class="statusValue"></dd>
+          </div>
+          <div>
+            <dt class="statusTerm">Last heartbeat</dt>
+            <dd id="status-heartbeat" class="statusValue"></dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="card">
+        <h2 class="sectionTitle">Command Lifecycle</h2>
+        <p id="lifecycle-empty" class="mutedText">No command events yet.</p>
+        <div id="lifecycle-details" class="latestDetails" hidden>
+          <p class="latestSummary"><span class="valueText">Latest:</span>&nbsp;<span id="latest-summary"></span></p>
+          <p id="latest-error" class="warningBox" hidden></p>
+          <ul id="event-history" class="commandList"></ul>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
