@@ -1,0 +1,17 @@
+[package]
+name = "fake-train"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shotexpress-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+rumqttc = { workspace = true }
+futures = { workspace = true }
+dotenvy = { workspace = true }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+rand = "0.10"
