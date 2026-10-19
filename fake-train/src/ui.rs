@@ -9,11 +9,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use shotexpress_protocol::{Direction, TrainState};
+use shotexpress_protocol::TrainState;
 
 use crate::belief::Belief;
-use crate::sim::{MotorMode, Simulator};
-use crate::track::{NODES, READINGS};
+use crate::sim::{Active, MotorMode, Simulator};
+use crate::track::{self, NODES, READINGS, RingPos};
 
 pub const TRACK_W: u16 = 100;
 pub const TRACK_H: u16 = 7;
@@ -23,6 +23,8 @@ pub const MIN_HEIGHT: u16 = 22;
 pub struct UiState<'a> {
     pub sim: &'a Simulator,
     pub connected: bool,
+    /// Simulated wifi coverage of the train (false = out of coverage).
+    pub signal: bool,
     pub broker: &'a str,
     pub paused: bool,
     pub sim_speed: f64,
@@ -95,6 +97,29 @@ pub fn position_on_edge(edge: usize, frac: f64) -> (u16, u16) {
         remaining -= len;
     }
     *points.last().unwrap()
+}
+
+enum ScreenHeading {
+    East,
+    West,
+    Turning,
+}
+
+/// Which way the tip of the train points on screen. The train sits on the
+/// ring facing forward, so this follows the ring direction at its position
+/// regardless of whether it is momentarily rolling backwards.
+fn screen_heading(pos: RingPos) -> ScreenHeading {
+    let (x1, _) = position_on_edge(pos.edge, pos.frac);
+    let (x2, _) = if pos.frac < 0.9 {
+        position_on_edge(pos.edge, pos.frac + 0.1)
+    } else {
+        position_on_edge(track::next_node(pos.edge), 0.1)
+    };
+    match x2.cmp(&x1) {
+        std::cmp::Ordering::Greater => ScreenHeading::East,
+        std::cmp::Ordering::Less => ScreenHeading::West,
+        std::cmp::Ordering::Equal => ScreenHeading::Turning,
+    }
 }
 
 static TRACK_ART: LazyLock<Vec<String>> = LazyLock::new(build_track_art);
@@ -186,9 +211,16 @@ pub fn draw(frame: &mut Frame, state: &UiState) {
             Style::default().fg(Color::Red),
         )
     };
+    let mut title = vec![Span::raw(" fake-train ─"), mqtt];
+    if !state.signal {
+        title.push(Span::styled(
+            "─ 📵 NO SIGNAL ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(Line::from(vec![Span::raw(" fake-train ─"), mqtt]));
+        .title(Line::from(title));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -257,12 +289,14 @@ fn draw_track(frame: &mut Frame, area: Rect, state: &UiState) {
         }
     }
 
-    // the train, topmost
+    // the train, topmost; the arrow marks the tip of the train, i.e. its
+    // orientation on the ring — rolling backwards does not flip it
     let (x, y) = position_on_edge(state.sim.truth.edge, state.sim.truth.frac);
     let wagon = if state.sim.loaded { "[OOO]" } else { "[   ]" };
-    let train = match state.sim.direction {
-        Direction::Forward => format!("{wagon}>"),
-        Direction::Reverse => format!("<{wagon}"),
+    let train = match screen_heading(state.sim.truth) {
+        ScreenHeading::East => format!("{wagon}>"),
+        ScreenHeading::West => format!("<{wagon}"),
+        ScreenHeading::Turning => wagon.to_string(),
     };
     let half = (train.chars().count() / 2) as u16;
     let (tx, ty) = cell(
@@ -290,16 +324,29 @@ fn draw_panels(frame: &mut Frame, area: Rect, state: &UiState) {
     let to = READINGS[(edge + 1) % NODES];
     let motor = match sim.motor {
         MotorMode::Stopped => "stopped".to_string(),
-        MotorMode::Json => format!("json speed {:.2}", sim.speed),
-        MotorMode::RawSteps { remaining_ms } => format!("raw steps ({remaining_ms:.0} ms left)"),
-        MotorMode::RawContinuous => format!("raw continuous speed {:.2}", sim.speed),
+        MotorMode::Drive => format!("drive speed {:.2}", sim.speed),
+        MotorMode::Steps {
+            remaining_steps,
+            backward,
+        } => format!(
+            "steps {} ({remaining_steps:.0} left)",
+            if backward { "backward" } else { "forward" }
+        ),
+        MotorMode::RawForward => format!("raw forward speed {:.2}", sim.speed),
+        MotorMode::RawBackward => format!("raw backward speed {:.2}", sim.speed),
+    };
+    let heading = match edge {
+        0..=3 => "eastbound",
+        4..=6 => "turnaround B",
+        7..=10 => "westbound",
+        _ => "turnaround A",
     };
     let truth = vec![
         Line::raw(format!(
             "edge  {from} → {to}  ({:.0}%)",
             sim.truth.frac * 100.0
         )),
-        Line::raw(format!("dir   {:?}", sim.direction)),
+        Line::raw(format!("track {heading}")),
         Line::raw(format!("motor {motor}")),
         Line::raw(format!(
             "state {}   battery {}%",
@@ -338,7 +385,7 @@ fn draw_panels(frame: &mut Frame, area: Rect, state: &UiState) {
                 ),
                 Line::raw(format!(
                     "next tag: {}",
-                    sim.localizer.predicted_next(sim.direction).unwrap_or("?")
+                    sim.localizer.predicted_next().unwrap_or("?")
                 )),
             ]
         }
@@ -349,15 +396,29 @@ fn draw_panels(frame: &mut Frame, area: Rect, state: &UiState) {
     );
 
     let command = match &sim.active {
-        Some(active) => vec![
-            Line::raw(format!("move_to → {}", active.target_tag)),
+        Some(Active::Drive {
+            legs,
+            ms_since_last_tag,
+            max_run_ms_without_tag,
+            distance_m,
+            ..
+        }) => vec![
             Line::raw(format!(
-                "no-tag {:.1}/{:.1} s",
-                active.ms_since_last_tag / 1000.0,
-                active.max_run_ms_without_tag as f64 / 1000.0
+                "drive → {} ({} leg(s) left)",
+                legs.last().map(|l| l.tag.as_str()).unwrap_or("?"),
+                legs.len()
             )),
-            Line::raw(format!("distance {:.1} m", active.distance_m)),
+            Line::raw(match legs.first() {
+                Some(leg) => format!("leg: {} @ {:.2}", leg.tag, leg.speed),
+                None => "leg: -".to_string(),
+            }),
+            Line::raw(format!(
+                "no-tag {:.1}/{:.1} s   distance {distance_m:.1} m",
+                ms_since_last_tag / 1000.0,
+                *max_run_ms_without_tag as f64 / 1000.0
+            )),
         ],
+        Some(Active::Steps { .. }) => vec![Line::raw("steps nudge (positioning)")],
         None => vec![
             Line::raw("no active command"),
             Line::raw(format!(
@@ -400,7 +461,7 @@ fn draw_log(frame: &mut Frame, area: Rect, state: &UiState) {
 fn draw_footer(frame: &mut Frame, area: Rect, state: &UiState) {
     let paused = if state.paused { "  ▌▌ PAUSED" } else { "" };
     let footer = format!(
-        " q quit   space pause   e shots   r randomize   +/- sim speed (x{:.2}){paused}",
+        " q quit   space pause   e shots   r randomize   s signal   +/- sim speed (x{:.2}){paused}",
         state.sim_speed
     );
     frame.render_widget(
@@ -414,7 +475,6 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use shotexpress_protocol::Direction;
 
     /// Renders a frame to text; run with `cargo test -p fake-train render -- --nocapture`
     /// to eyeball the layout.
@@ -422,7 +482,6 @@ mod tests {
     fn render_smoke_test() {
         let mut sim = Simulator::new(&mut rand::rng(), 0);
         sim.truth = crate::track::RingPos { edge: 1, frac: 0.5 };
-        sim.direction = Direction::Forward;
         let mut log = VecDeque::new();
         log.push_back((
             "00:01.2".to_string(),
@@ -436,6 +495,7 @@ mod tests {
         let state = UiState {
             sim: &sim,
             connected: true,
+            signal: true,
             broker: "mqtt://localhost:1883",
             paused: false,
             sim_speed: 1.0,

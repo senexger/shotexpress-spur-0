@@ -145,6 +145,15 @@ p.page-subtitle {
   cursor: not-allowed;
 }
 
+.buttonDanger:not(:disabled) {
+  background-color: var(--color-danger-text);
+}
+
+.statusDead {
+  color: var(--color-danger-text);
+  font-weight: 600;
+}
+
 .latestSummary {
   display: inline-flex;
   flex-wrap: wrap;

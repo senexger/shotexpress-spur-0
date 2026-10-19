@@ -78,7 +78,7 @@ export function createStatus(envelope: Envelope, options: StatusOptions): Status
     state: options.state,
     battery_pct: options.battery_pct,
     status_uptime_ms: options.status_uptime_ms,
-  } satisfies ContinueCommand;
+  } satisfies StatusMessage;
 };
 
 export function createStatusMessage(status: StatusMessage): PublishableMessage {

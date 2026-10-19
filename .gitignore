@@ -3,6 +3,7 @@
 compile_commands.json
 Train/.clang-format
 Train/credentials.h
+fuel-station/credentials.h
 
 # Webserver project files
 webserver/node_modules/

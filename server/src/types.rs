@@ -2,7 +2,7 @@ pub use shotexpress_protocol::*;
 
 use serde::{Deserialize, Serialize};
 
-// ---- server-side view types (controllerTypes.ts) ----
+// ---- server-side view types ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -15,17 +15,42 @@ pub enum ConnectionState {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ControllerSnapshot {
     pub connection: ConnectionState,
-    #[serde(rename = "lastStatus")]
     pub last_status: Option<StatusMessage>,
     pub events: Vec<ExecEvent>,
-    #[serde(rename = "isBusy")]
     pub is_busy: bool,
     pub error: Option<String>,
+    /// Last ring position the server could pin from progress tags, if any.
+    pub last_known_tag: Option<String>,
+    /// Last raw RFID read (shotexpress/event/tag), commands or not. Setup
+    /// aid — shows the uid of whatever tag the reader just passed.
+    pub last_tag_read: Option<TagRead>,
+    /// Last non-JSON payload on the status topic. The legacy firmware
+    /// heartbeats plain "Alive" — enough to show the train as online even
+    /// though it carries no state/battery.
+    pub last_raw_status: Option<RawStatus>,
+    /// False until the train's first message, and again once the heartbeat
+    /// goes quiet for longer than the offline timeout.
+    pub train_online: bool,
 }
 
-// ---- SSE / broadcast events (TrainServiceEvent) ----
+#[derive(Debug, Clone, Serialize)]
+pub struct TagRead {
+    pub tag: String,
+    /// Server receive time; the raw tag topic carries no envelope.
+    pub ts_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RawStatus {
+    pub raw: String,
+    /// Server receive time; the raw payload carries no envelope.
+    pub ts_ms: u64,
+}
+
+// ---- SSE / broadcast events ----
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "payload", rename_all = "lowercase")]
@@ -36,57 +61,57 @@ pub enum TrainServiceEvent {
     Busy(bool),
     Error(Option<String>),
     Snapshot(ControllerSnapshot),
+    #[serde(rename = "tag")]
+    TagRead(TagRead),
+    RawStatus(RawStatus),
+    Liveness(bool),
 }
 
 // ---- HTTP request bodies ----
 
-#[derive(Debug, Default, Deserialize)]
-pub struct CommandRequestBody {
-    pub ttl_ms: Option<u64>,
-    pub parameters: Option<PartialMoveParameters>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct PartialMoveParameters {
-    pub target: Option<Target>,
+/// POST /api/train/command — a ride request. The server compiles the legs
+/// from track.toml; clients only name the station.
+#[derive(Debug, Deserialize)]
+pub struct RideRequestBody {
+    pub target: String,
+    #[serde(default)]
     pub speed: Option<f64>,
-    pub direction: Option<Direction>,
-    pub expected_tags: Option<Vec<String>>,
-    pub stop_on_tag: Option<String>,
-    pub max_run_ms_without_tag: Option<u64>,
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
 }
 
-impl PartialMoveParameters {
-    pub fn merge_over(self, defaults: MoveCommandParameters) -> MoveCommandParameters {
-        MoveCommandParameters {
-            target: self.target.unwrap_or(defaults.target),
-            speed: self.speed.unwrap_or(defaults.speed),
-            direction: self.direction.unwrap_or(defaults.direction),
-            expected_tags: self.expected_tags.unwrap_or(defaults.expected_tags),
-            stop_on_tag: self.stop_on_tag.unwrap_or(defaults.stop_on_tag),
-            max_run_ms_without_tag: self
-                .max_run_ms_without_tag
-                .unwrap_or(defaults.max_run_ms_without_tag),
-        }
-    }
+/// POST /api/train/steps — a positioning nudge (refill choreography).
+#[derive(Debug, Deserialize)]
+pub struct StepsRequestBody {
+    #[serde(default)]
+    pub steps: Option<u32>,
+    pub direction: Direction,
+    #[serde(default)]
+    pub speed: Option<f64>,
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
 }
 
+/// Raw firmware integers on shotexpress/command, matching Train.ino:
+/// 0 = stopMove(), 1 = move(1000 steps), 2 = runBackward() (continuous),
+/// 3 = runForward() (continuous). Debug/maintenance only — no cmd_id, no
+/// exec events; the acked JSON commands are the real interface.
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum ManualAction {
     Stop,
     Steps,
-    Run,
+    Forward,
+    Backward,
 }
 
 impl ManualAction {
-    /// Raw integer protocol of the current Train.ino firmware:
-    /// 0 = stopMove(), 1 = move(1000 steps), 2 = runBackward() (continuous)
     pub fn firmware_payload(self) -> &'static str {
         match self {
             ManualAction::Stop => "0",
             ManualAction::Steps => "1",
-            ManualAction::Run => "2",
+            ManualAction::Backward => "2",
+            ManualAction::Forward => "3",
         }
     }
 }
@@ -126,13 +151,45 @@ mod tests {
                     events: vec![],
                     is_busy: false,
                     error: None,
+                    last_known_tag: None,
+                    last_tag_read: None,
+                    last_raw_status: None,
+                    train_online: false,
                 }),
                 json!({"type": "snapshot", "payload": {
                     "connection": "connecting",
                     "lastStatus": null,
                     "events": [],
                     "isBusy": false,
-                    "error": null
+                    "error": null,
+                    "lastKnownTag": null,
+                    "lastTagRead": null,
+                    "lastRawStatus": null,
+                    "trainOnline": false
+                }}),
+            ),
+            (
+                TrainServiceEvent::Liveness(true),
+                json!({"type": "liveness", "payload": true}),
+            ),
+            (
+                TrainServiceEvent::RawStatus(RawStatus {
+                    raw: "Alive".into(),
+                    ts_ms: 1_751_500_000_000,
+                }),
+                json!({"type": "rawstatus", "payload": {
+                    "raw": "Alive",
+                    "ts_ms": 1751500000000u64
+                }}),
+            ),
+            (
+                TrainServiceEvent::TagRead(TagRead {
+                    tag: "04A1B2C3".into(),
+                    ts_ms: 1_751_500_000_000,
+                }),
+                json!({"type": "tag", "payload": {
+                    "tag": "04A1B2C3",
+                    "ts_ms": 1751500000000u64
                 }}),
             ),
         ];
@@ -142,25 +199,23 @@ mod tests {
     }
 
     #[test]
-    fn partial_parameters_merge_over_defaults() {
-        let body: CommandRequestBody = serde_json::from_value(json!({
-            "ttl_ms": 5000,
-            "parameters": {"speed": 0.3, "target": "bar"}
-        }))
-        .unwrap();
-        let params = body
-            .parameters
-            .unwrap()
-            .merge_over(default_move_parameters());
-        assert!(matches!(params.target, Target::Bar));
-        assert_eq!(params.speed, 0.3);
-        assert!(matches!(params.direction, Direction::Forward));
-        assert_eq!(params.stop_on_tag, "tag_07");
+    fn ride_request_parses_with_defaults() {
+        let body: RideRequestBody =
+            serde_json::from_value(json!({"target": "bar", "speed": 0.3})).unwrap();
+        assert_eq!(body.target, "bar");
+        assert_eq!(body.speed, Some(0.3));
+        assert_eq!(body.ttl_ms, None);
+        assert!(serde_json::from_value::<RideRequestBody>(json!({})).is_err());
     }
 
     #[test]
     fn manual_action_payloads() {
-        for (raw, expected) in [("stop", "0"), ("steps", "1"), ("run", "2")] {
+        for (raw, expected) in [
+            ("stop", "0"),
+            ("steps", "1"),
+            ("backward", "2"),
+            ("forward", "3"),
+        ] {
             let action: ManualAction = serde_json::from_value(json!(raw)).unwrap();
             assert_eq!(action.firmware_payload(), expected);
         }

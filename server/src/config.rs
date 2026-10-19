@@ -1,5 +1,6 @@
 use std::env;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -9,6 +10,8 @@ pub struct Config {
     pub mqtt_password: Option<String>,
     pub mqtt_client_id: String,
     pub http_port: u16,
+    /// Path to track.toml (env TRACK_CONFIG, default repo-root track.toml).
+    pub track_path: PathBuf,
 }
 
 impl Config {
@@ -31,6 +34,9 @@ impl Config {
             mqtt_password: env::var("MQTT_PASSWORD").ok().filter(|v| !v.is_empty()),
             mqtt_client_id: random_client_id(),
             http_port,
+            track_path: env::var("TRACK_CONFIG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("track.toml")),
         })
     }
 }

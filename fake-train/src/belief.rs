@@ -1,11 +1,10 @@
-//! The train's position belief, computed only from tag readings and the
-//! (always known) motor direction — never from the simulation's ground truth.
-//! Spawn position is unknown; one reading narrows it to the tag's candidate
-//! edges (curve tags are unique, so they localize immediately); a second
-//! consecutive reading with unchanged motor direction pins it down.
+//! The train's position belief, computed only from tag readings — never from
+//! the simulation's ground truth. The train always runs forward, so the
+//! reading order is fixed: spawn position is unknown; one reading narrows it
+//! to the tag's candidate edges (curve tags are unique, so they localize
+//! immediately); a second consecutive reading pins it down.
 
-use crate::track::{self, READINGS};
-use shotexpress_protocol::Direction;
+use crate::track::{self, NODES, READINGS};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Belief {
@@ -23,7 +22,7 @@ pub enum Belief {
 #[derive(Debug)]
 pub struct Localizer {
     pub belief: Belief,
-    last_reading: Option<(&'static str, Direction)>,
+    last_reading: Option<&'static str>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -51,57 +50,84 @@ impl Localizer {
         self.last_reading = None;
     }
 
-    /// A pair of readings only identifies the edge if the motor direction did
-    /// not change in between; an already-localized belief stays valid.
-    pub fn on_direction_change(&mut self) {
-        self.last_reading = None;
-    }
-
-    pub fn on_reading(&mut self, tag: &'static str, dir: Direction) -> LocalizeOutcome {
+    pub fn on_reading(&mut self, tag: &'static str) -> LocalizeOutcome {
         let outcome = match &self.belief {
             Belief::Localized { edge } => {
-                let predicted_node = track::next_node(*edge, dir);
+                let predicted_node = track::next_node(*edge);
                 if READINGS[predicted_node] == tag {
-                    let new_edge = track::edge_after_crossing(predicted_node, dir);
-                    self.belief = Belief::Localized { edge: new_edge };
-                    LocalizeOutcome::Tracking(new_edge)
+                    self.belief = Belief::Localized {
+                        edge: predicted_node,
+                    };
+                    LocalizeOutcome::Tracking(predicted_node)
                 } else {
                     let expected = READINGS[predicted_node];
-                    self.set_candidates(tag, dir);
+                    self.set_candidates(tag);
                     LocalizeOutcome::Mismatch { expected, got: tag }
                 }
             }
             _ => {
                 let paired = self
                     .last_reading
-                    .filter(|(_, prev_dir)| *prev_dir == dir)
-                    .and_then(|(prev, _)| track::localize(prev, tag, dir));
+                    .and_then(|prev| track::localize(prev, tag));
                 match paired {
                     Some(edge) => {
                         self.belief = Belief::Localized { edge };
                         LocalizeOutcome::JustLocalized(edge)
                     }
-                    None => self.set_candidates(tag, dir),
+                    None => self.set_candidates(tag),
                 }
             }
         };
-        self.last_reading = Some((tag, dir));
+        self.last_reading = Some(tag);
         outcome
     }
 
-    /// Predicted next reading, if localized.
-    pub fn predicted_next(&self, dir: Direction) -> Option<&'static str> {
+    /// A tag read while the train is driven backward (manual mode only).
+    /// The pair table assumes forward reading order, so no pair inference —
+    /// but an existing localization is tracked, and unique tags still pin
+    /// the position.
+    pub fn on_reading_backward(&mut self, tag: &'static str) -> LocalizeOutcome {
+        self.last_reading = None; // forward pairs must not span backward reads
         match &self.belief {
-            Belief::Localized { edge } => Some(READINGS[track::next_node(*edge, dir)]),
+            Belief::Localized { edge } => {
+                // moving backward on edge e, the next node crossed is node e
+                if READINGS[*edge] == tag {
+                    let new_edge = (*edge + NODES - 1) % NODES;
+                    self.belief = Belief::Localized { edge: new_edge };
+                    LocalizeOutcome::Tracking(new_edge)
+                } else {
+                    let expected = READINGS[*edge];
+                    self.set_candidates_backward(tag);
+                    LocalizeOutcome::Mismatch { expected, got: tag }
+                }
+            }
+            _ => self.set_candidates_backward(tag),
+        }
+    }
+
+    /// Predicted next reading, if localized.
+    pub fn predicted_next(&self) -> Option<&'static str> {
+        match &self.belief {
+            Belief::Localized { edge } => Some(READINGS[track::next_node(*edge)]),
             _ => None,
         }
     }
 
-    fn set_candidates(&mut self, tag: &'static str, dir: Direction) -> LocalizeOutcome {
-        let edges: Vec<usize> = track::nodes_for_tag(tag)
+    fn set_candidates(&mut self, tag: &'static str) -> LocalizeOutcome {
+        // crossing node j forward puts the train on edge j
+        self.apply_candidates(tag, track::nodes_for_tag(tag))
+    }
+
+    fn set_candidates_backward(&mut self, tag: &'static str) -> LocalizeOutcome {
+        // crossing node j backward puts the train on edge j - 1
+        let edges = track::nodes_for_tag(tag)
             .into_iter()
-            .map(|node| track::edge_after_crossing(node, dir))
+            .map(|node| (node + NODES - 1) % NODES)
             .collect();
+        self.apply_candidates(tag, edges)
+    }
+
+    fn apply_candidates(&mut self, tag: &'static str, edges: Vec<usize>) -> LocalizeOutcome {
         if edges.len() == 1 {
             let edge = edges[0];
             self.belief = Belief::Localized { edge };
@@ -119,7 +145,6 @@ impl Localizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::track::NODES;
 
     /// Canonical reading for a node index, as a `&'static str` from READINGS.
     fn tag(node: usize) -> &'static str {
@@ -129,7 +154,7 @@ mod tests {
     #[test]
     fn single_main_tag_gives_two_candidates() {
         let mut loc = Localizer::new();
-        let outcome = loc.on_reading(tag(2), Direction::Forward); // station2
+        let outcome = loc.on_reading(tag(2)); // station2
         assert_eq!(outcome, LocalizeOutcome::Candidates(2));
         match &loc.belief {
             Belief::Candidates { edges, .. } => assert_eq!(edges, &vec![2, 9]),
@@ -140,50 +165,31 @@ mod tests {
     #[test]
     fn curve_tag_localizes_immediately() {
         let mut loc = Localizer::new();
-        let outcome = loc.on_reading("curveB1", Direction::Forward);
+        let outcome = loc.on_reading("curveB1");
         assert_eq!(outcome, LocalizeOutcome::JustLocalized(5));
     }
 
     #[test]
-    fn two_readings_localize_in_both_directions() {
+    fn two_readings_localize() {
         let mut loc = Localizer::new();
-        loc.on_reading("station1", Direction::Forward);
-        let outcome = loc.on_reading("track12", Direction::Forward);
+        loc.on_reading("station1");
+        let outcome = loc.on_reading("track12");
         assert_eq!(outcome, LocalizeOutcome::JustLocalized(1));
 
+        // the westbound pass of the same tags resolves differently
         let mut loc = Localizer::new();
-        loc.on_reading("track12", Direction::Reverse);
-        let outcome = loc.on_reading("station1", Direction::Reverse);
-        assert_eq!(outcome, LocalizeOutcome::JustLocalized(13));
-    }
-
-    #[test]
-    fn direction_change_drops_the_pair_but_keeps_localization() {
-        let mut loc = Localizer::new();
-        loc.on_reading("station1", Direction::Forward);
-        loc.on_direction_change();
-        // pair (station1, station2) does not exist; without the drop this
-        // would mis-localize, with it we get fresh candidates
-        let outcome = loc.on_reading("station2", Direction::Reverse);
-        assert_eq!(outcome, LocalizeOutcome::Candidates(2));
-
-        // once localized, reversing keeps the edge and flips the prediction
-        let mut loc = Localizer::new();
-        loc.on_reading("station1", Direction::Forward);
-        loc.on_reading("track12", Direction::Forward); // edge 1
-        loc.on_direction_change();
-        assert_eq!(loc.predicted_next(Direction::Reverse), Some("track12"));
-        let outcome = loc.on_reading("track12", Direction::Reverse);
-        assert_eq!(outcome, LocalizeOutcome::Tracking(0));
+        loc.on_reading("station2");
+        let outcome = loc.on_reading("track12");
+        assert_eq!(outcome, LocalizeOutcome::JustLocalized(10));
     }
 
     #[test]
     fn mismatch_falls_back_to_candidates() {
         let mut loc = Localizer::new();
-        loc.on_reading("station1", Direction::Forward);
-        loc.on_reading("track12", Direction::Forward); // localized on edge 1
+        loc.on_reading("station1");
+        loc.on_reading("track12"); // localized on edge 1
         // teleported: reads station3 instead of predicted station2
-        let outcome = loc.on_reading("station3", Direction::Forward);
+        let outcome = loc.on_reading("station3");
         assert_eq!(
             outcome,
             LocalizeOutcome::Mismatch {
@@ -195,13 +201,40 @@ mod tests {
     }
 
     #[test]
+    fn backward_reads_track_but_do_not_pair() {
+        // localized on edge 1 (between track12 and station2)
+        let mut loc = Localizer::new();
+        loc.on_reading("station1");
+        loc.on_reading("track12");
+        // backing up crosses track12 (node 1) again -> edge 0
+        assert_eq!(
+            loc.on_reading_backward("track12"),
+            LocalizeOutcome::Tracking(0)
+        );
+        // and station1 (node 0) -> edge 13
+        assert_eq!(
+            loc.on_reading_backward("station1"),
+            LocalizeOutcome::Tracking(13)
+        );
+
+        // unlocalized: a backward main-line read gives candidates, and the
+        // next forward read must NOT pair with it
+        let mut loc = Localizer::new();
+        assert_eq!(
+            loc.on_reading_backward("station2"),
+            LocalizeOutcome::Candidates(2)
+        );
+        assert_eq!(loc.on_reading("track23"), LocalizeOutcome::Candidates(2));
+    }
+
+    #[test]
     fn full_lap_tracks_every_node() {
         let mut loc = Localizer::new();
-        loc.on_reading(tag(0), Direction::Forward);
-        loc.on_reading(tag(1), Direction::Forward);
+        loc.on_reading(tag(0));
+        loc.on_reading(tag(1));
         let mut edge = 1;
         for node in 2..(2 * NODES) {
-            let outcome = loc.on_reading(tag(node), Direction::Forward);
+            let outcome = loc.on_reading(tag(node));
             edge = (edge + 1) % NODES;
             assert_eq!(outcome, LocalizeOutcome::Tracking(edge));
         }

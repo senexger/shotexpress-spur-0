@@ -1,11 +1,31 @@
 "use client";
 
-import React from "react";
+import React, { useState } from "react";
 import { useTrainController } from "../hooks/useTrainController";
 import styles from "../components/TrainDashboard.module.css";
 
+type ManualAction = "stop" | "steps" | "run";
+
 export function TrainDashboard() {
   const { connection, lastStatus, events, sendTrainToRaucherecke, isBusy, error } = useTrainController();
+  const [manualError, setManualError] = useState<string | null>(null);
+
+  const sendManual = async (action: ManualAction) => {
+    setManualError(null);
+    try {
+      const response = await fetch("/api/train/manual", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        setManualError(body?.error ?? `Manual command failed (${response.status})`);
+      }
+    } catch (err) {
+      setManualError(err instanceof Error ? err.message : "Manual command failed");
+    }
+  };
 
   const latestEvent = events.at(-1) ?? null;
   const commandHistory = [...events].slice(-5).reverse();
@@ -27,6 +47,28 @@ export function TrainDashboard() {
         >
           {isBusy ? "Command in progress…" : "Send train to Raucherecke"}
         </button>
+      </section>
+
+      <section className={styles.card}>
+        <h2 className={styles.sectionTitle}>Manual Control</h2>
+        <p className={styles.mutedText}>
+          Raw firmware commands (0/1/2). The firmware ignores repeated commands — press Stop before
+          moving steps again.
+        </p>
+        {manualError && (
+          <p className={`${styles.warningBox} ${styles.sectionError}`}>{manualError}</p>
+        )}
+        <div className={styles.manualButtonRow}>
+          <button onClick={() => sendManual("steps")} className={styles.button}>
+            Move 1000 steps
+          </button>
+          <button onClick={() => sendManual("run")} className={styles.button}>
+            Run continuous
+          </button>
+          <button onClick={() => sendManual("stop")} className={styles.button}>
+            Stop
+          </button>
+        </div>
       </section>
 
       <section className={styles.card}>

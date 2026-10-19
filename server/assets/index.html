@@ -3,43 +3,48 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ShotExpress Control</title>
+  <title>ShotExpress</title>
   <link rel="stylesheet" href="/style.css" />
   <script src="/app.js" defer></script>
 </head>
 <body>
   <main class="control-page">
     <header class="page-header">
-      <h1 class="page-title">ShotExpress Control</h1>
+      <h1 class="page-title">ShotExpress</h1>
       <p class="page-subtitle">
-        Dispatch the train to the Raucherecke and track its progress in real time.
+        Order the shot train to your station and watch it roll in.
+        (Setup and track config live in the admin TUI.)
       </p>
     </header>
 
     <div class="dashboard">
       <section class="card">
-        <h2 class="sectionTitle">Train Control</h2>
+        <h2 class="sectionTitle">Call the Train</h2>
         <p class="mutedText">Connection: <span id="connection-label">Connecting</span></p>
         <p id="control-error" class="warningBox sectionError" hidden></p>
-        <button id="send-button" class="button" disabled>Send train to Raucherecke</button>
+        <div id="station-buttons" class="manualButtonRow">
+          <p class="mutedText">Loading stations…</p>
+        </div>
       </section>
 
       <section class="card">
-        <h2 class="sectionTitle">Manual Control</h2>
+        <h2 class="sectionTitle">Manual Override</h2>
         <p class="mutedText">
-          Raw firmware commands (0/1/2). The firmware ignores repeated commands — press Stop before
-          moving steps again.
+          Raw firmware commands. Sending one ends the current ride
+          (e.g. a drive to Raucherecke) and takes direct control.
         </p>
         <p id="manual-error" class="warningBox sectionError" hidden></p>
         <div class="manualButtonRow">
-          <button class="button" data-action="steps">Move 1000 steps</button>
-          <button class="button" data-action="run">Run continuous</button>
-          <button class="button" data-action="stop">Stop</button>
+          <button id="manual-backward" class="button" data-action="backward">◀ Backward</button>
+          <button id="manual-steps" class="button" data-action="steps">Steps ×1000</button>
+          <button id="manual-forward" class="button" data-action="forward">Forward ▶</button>
+          <button id="manual-stop" class="button buttonDanger" data-action="stop">■ Stop</button>
         </div>
       </section>
 
       <section class="card">
         <h2 class="sectionTitle">Live Status</h2>
+        <p class="mutedText">Last tag: <span id="status-last-tag" class="valueText">—</span></p>
         <p id="status-empty" class="mutedText">No status messages yet.</p>
         <dl id="status-grid" class="statusGrid" hidden>
           <div>

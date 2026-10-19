@@ -9,23 +9,24 @@
 #include "credentials.h"
 // #include <ArduinoOTA.h>
 
-constexpr int STEP_PIN = 2;
-constexpr int DIR_PIN =  19;
-constexpr int EN_PIN =   5;
-constexpr int RST_PIN = 22;
-constexpr int SS_PIN = 15;
-constexpr int SCK_PIN = 14;
+constexpr int STEP_PIN = 18;
+constexpr int DIR_PIN  = 19;
+constexpr int EN_PIN   = 5;
+constexpr int RST_PIN  = 22;
+constexpr int SS_PIN   = 15;
+constexpr int SCK_PIN  = 14;
 constexpr int MISO_PIN = 13;
 constexpr int MOSI_PIN = 12;
 
 constexpr unsigned long WIFI_RETRY_INTERVAL = 5000;
 constexpr unsigned long MQTT_PUBLISH_INTERVAL = 1000;
 constexpr unsigned long RFID_CHECK_INTERVAL = 250;
-constexpr unsigned long MAX_SPEED = 12000;
-constexpr unsigned long ACCELERATION = 1000;
 
-constexpr const char* ssid = SECRET_PASS;
-constexpr const char* pass = SECRET_SSID;
+constexpr unsigned long MAX_SPEED = 10000;
+constexpr unsigned long ACCELERATION = 500;
+
+constexpr const char* ssid = SECRET_SSID;
+constexpr const char* pass = SECRET_PASS;
 constexpr const char* mqttClientID = "StupidStepper"; // TODO rename?
 constexpr const char* mqttClientUsername = "admin";
 constexpr const char* mqttClientPassword = "123";
@@ -78,13 +79,17 @@ void messageReceived(String &topic, String &payload) {
     currentState = newCommand;
 
     switch (currentState) {
+      case 3:
+        stepper->runForward();
+        debugPrintln("Status: Run Forward");
+        break;
       case 2:
         stepper->runBackward();
         debugPrintln("Status: Run Backward");
         break;
       case 1:
         stepper->move(1000);
-        debugPrintln("Status: Run Backward");
+        debugPrintln("Status: Move 1000 Steps");
         break;
       case 0:
         stepper->stopMove();
@@ -219,7 +224,15 @@ void loop() {
     mqttClient.loop();
 
     if (millis() - lastPublishTime > MQTT_PUBLISH_INTERVAL) {
-      mqttClient.publish("shotexpress/status", "Alive");
+      // motor telemetry in the heartbeat: the web UI shows this string
+      // verbatim, so a climbing hz/pos proves the ESP32 is commanding motion
+      String status = "Alive";
+      if (stepper) {
+        status += " run=" + String(stepper->isRunning() ? 1 : 0);
+        status += " hz=" + String(stepper->getCurrentSpeedInMilliHz() / 1000);
+        status += " pos=" + String(stepper->getCurrentPosition());
+      }
+      mqttClient.publish("shotexpress/status", status);
       lastPublishTime = millis();
     }
   }
@@ -241,6 +254,10 @@ void loop() {
 
     if (lastReadTag != "") {
       Serial.println("Card ID : " + lastReadTag);
+      if (mqttClient.connected()) {
+        // raw uid, no JSON — the server shows it as "last tag" (setup aid)
+        mqttClient.publish("shotexpress/event/tag", lastReadTag);
+      }
       lastReadTag = "";
     }
   }

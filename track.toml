@@ -1,0 +1,135 @@
+# ShotExpress track map — the single source of truth for routing, speeds and
+# stations. The server compiles every ride into a leg schedule from this file;
+# the train itself never sees it. Edit + POST /api/admin/track/reload (or
+# restart the server) to apply.
+#
+# The physical track is a dogbone: a main line with a passive turnaround loop
+# at each end. Flattened into driving order it is a ring of tag readings —
+# eastbound main line, loop B, westbound main line (same physical track,
+# opposite pass), loop A. Main-line tags therefore appear at two ring nodes,
+# curve tags at one. The train only ever runs forward around this ring.
+
+[train]
+max_speed = 1.0                 # hard clamp on any commanded speed
+default_speed = 0.6             # cruise speed when a ride doesn't specify one
+accel = 0.5                     # speed ramp, normalized units/s (gentle = no spilled shots)
+max_run_ms_without_tag = 7000   # RFID watchdog: safe-stop after this long without a read
+default_ttl_ms = 60000
+
+[refill]
+station = "bar"                 # where the laser station sits
+steps = 1000                    # one positioning nudge during refill
+speed = 0.2
+
+# Stations, addressable by ride commands. `approach_speed` is used on the
+# final leg into the stop tag (crawl = reliable read = no overshoot);
+# `pass_through_speed` caps the leg into a station the train rolls through
+# without stopping (looks good, spills nothing). Keep approach_speed high
+# enough that edge_ms / approach_speed stays below max_run_ms_without_tag —
+# the loader rejects the config otherwise.
+
+[[station]]
+name = "bar"
+tag = "station1"
+approach_speed = 0.35
+pass_through_speed = 0.4
+
+[[station]]
+name = "schachbrett"
+tag = "station2"
+approach_speed = 0.35
+pass_through_speed = 0.4
+
+[[station]]
+name = "raucherecke"
+tag = "station3"
+approach_speed = 0.35
+pass_through_speed = 0.4
+
+# Ring nodes in driving order. `tag` is the reading when crossing into the
+# node; `edge_ms` / `edge_len_m` / `speed_limit` describe the edge *leaving*
+# it (nominal traversal time at speed 1.0, physical length, curve speed cap).
+
+[[node]] # 0: eastbound main line
+tag = "station1"
+edge_ms = 2000
+edge_len_m = 1.2
+speed_limit = 1.0
+
+[[node]] # 1
+tag = "track12"
+edge_ms = 2000
+edge_len_m = 1.2
+speed_limit = 1.0
+
+[[node]] # 2
+tag = "station2"
+edge_ms = 2000
+edge_len_m = 1.2
+speed_limit = 1.0
+
+[[node]] # 3
+tag = "track23"
+edge_ms = 2000
+edge_len_m = 1.2
+speed_limit = 1.0
+
+[[node]] # 4: link into loop B (east turnaround)
+tag = "station3"
+edge_ms = 2000
+edge_len_m = 1.5
+speed_limit = 1.0
+
+[[node]] # 5: the turnaround curve itself
+tag = "curveB1"
+edge_ms = 2500
+edge_len_m = 2.0
+speed_limit = 0.5
+
+[[node]] # 6: link back onto the main line
+tag = "curveB2"
+edge_ms = 2000
+edge_len_m = 1.5
+speed_limit = 1.0
+
+[[node]] # 7: westbound main line
+tag = "station3"
+edge_ms = 2000
+edge_len_m = 1.2
+speed_limit = 1.0
+
+[[node]] # 8
+tag = "track23"
+edge_ms = 2000
+edge_len_m = 1.2
+speed_limit = 1.0
+
+[[node]] # 9
+tag = "station2"
+edge_ms = 2000
+edge_len_m = 1.2
+speed_limit = 1.0
+
+[[node]] # 10
+tag = "track12"
+edge_ms = 2000
+edge_len_m = 1.2
+speed_limit = 1.0
+
+[[node]] # 11: link into loop A (west turnaround)
+tag = "station1"
+edge_ms = 2000
+edge_len_m = 1.5
+speed_limit = 1.0
+
+[[node]] # 12: the turnaround curve
+tag = "curveA1"
+edge_ms = 2500
+edge_len_m = 2.0
+speed_limit = 0.5
+
+[[node]] # 13: link back to station1
+tag = "curveA2"
+edge_ms = 2000
+edge_len_m = 1.5
+speed_limit = 1.0

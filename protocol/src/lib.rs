@@ -1,8 +1,13 @@
-//! MQTT wire types shared by the control server and the train simulator.
+//! MQTT wire types shared by the control server, the train simulator and
+//! (eventually) the real firmware.
 //!
-//! Source of truth for the message shapes is `webserver/lib/schemas.ts`
-//! (`exec_type` discriminator); the root README's spec is stale where it says
-//! `event_type`/`started`.
+//! Design rule: the train is a dumb executor. It receives *data*, never
+//! logic — a `drive` command is an ordered list of legs ("drive at `speed`
+//! until you read `tag`"), compiled by the server from its track map. The
+//! train holds no map, runs autonomous rides forward-only (passive
+//! turnaround switches), and must be able to finish any single command
+//! with zero connectivity. `direction` exists only on `steps`, the
+//! precise-positioning primitive used under live server control (refill).
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -10,20 +15,20 @@ use uuid::Uuid;
 pub const TOPIC_COMMAND: &str = "shotexpress/command";
 pub const TOPIC_STATUS: &str = "shotexpress/status";
 pub const TOPIC_EVENT_EXEC: &str = "shotexpress/event/exec";
+/// Every RFID read, as a plain-text payload holding just the tag id — no
+/// JSON, no envelope, published even outside commands (manual driving).
+/// Setup aid for mapping physical tag uids to track.toml names; the server
+/// must not use it for localization (backward moves produce reversed pairs).
+pub const TOPIC_EVENT_TAG: &str = "shotexpress/event/tag";
 
 pub const DEFAULT_TTL_MS: u64 = 60_000;
 
-pub fn default_move_parameters() -> MoveCommandParameters {
-    MoveCommandParameters {
-        target: Target::Raucherecke,
-        speed: 0.6,
-        direction: Direction::Forward,
-        expected_tags: ["tag_02", "tag_03", "tag_04", "tag_05", "tag_06"]
-            .map(String::from)
-            .to_vec(),
-        stop_on_tag: "tag_07".to_string(),
-        max_run_ms_without_tag: 7_000,
-    }
+/// Milliseconds since the unix epoch — the clock every `ts_ms` field uses.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64
 }
 
 // ---- envelope ----
@@ -36,7 +41,8 @@ pub struct Envelope {
     pub ts_ms: u64,
 }
 
-/// The TS schema allows `cmd_id` to be a uuid or the empty string.
+/// `cmd_id` on the wire is a uuid or the empty string (status heartbeats
+/// outside a command carry no cmd_id).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmdId {
     None,
@@ -79,9 +85,12 @@ pub struct ExecEvent {
 pub enum ExecKind {
     Accepted,
     Progress {
-        direction: Direction,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        progress: Option<ProgressDetails>,
+        last_tag: String,
+        distance_m: f64,
+        /// Tags the reader missed since the previous progress event; the
+        /// train resynced forward past them (harmless on a one-way ring).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        skipped: u32,
     },
     Completed,
     Failed {
@@ -89,6 +98,10 @@ pub enum ExecKind {
     },
     Cancelled,
     Expired,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl ExecKind {
@@ -100,14 +113,10 @@ impl ExecKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgressDetails {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_tag: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub distance_m: Option<f64>,
-}
-
+/// Well-known `ExecError::code` values emitted by the train:
+/// `RFID_TIMEOUT` (no tag within `max_run_ms_without_tag`, safe-stopped),
+/// `OVERSHOT` (missed the stop tag, safe-stopped one tag past the target),
+/// `UNEXPECTED_TAG` (tag not in the remaining legs, safe-stopped).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecError {
     pub code: String,
@@ -119,15 +128,6 @@ pub struct ExecError {
 pub enum Direction {
     Forward,
     Reverse,
-}
-
-impl Direction {
-    pub fn reversed(self) -> Direction {
-        match self {
-            Direction::Forward => Direction::Reverse,
-            Direction::Reverse => Direction::Forward,
-        }
-    }
 }
 
 // ---- status (shotexpress/status) ----
@@ -175,20 +175,37 @@ pub struct CommandMessage {
     pub kind: CommandKind,
 }
 
+/// One leg of a drive: hold `speed` until `tag` is read. The speed applies
+/// on the track *leading to* the tag, so slowing before a curve or station
+/// is a matter of tag placement, decided by the server's map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Leg {
+    pub tag: String,
+    pub speed: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd_type", rename_all = "snake_case")]
 pub enum CommandKind {
     Stop,
-    WaitForLoad {
-        wait_time_ms: u64,
+    /// Autonomous ride, forward-only. The last leg's tag is the stop tag;
+    /// empty `legs` means "come to a stop" and completes immediately.
+    /// Offline-completable: everything needed is in the payload.
+    Drive {
+        legs: Vec<Leg>,
+        /// Speed ramp rate in normalized speed units per second (gentle
+        /// ramps keep the shots in their glasses).
+        accel: f64,
+        max_run_ms_without_tag: u64,
         ttl_ms: u64,
     },
-    MoveTo {
-        params: MoveCommandParameters,
-        ttl_ms: u64,
-    },
-    Continue {
-        params: MoveCommandParameters,
+    /// Precise positioning by step count. The only command that may go
+    /// backward — sent exclusively under live server control (refill at
+    /// the bar), never as part of an autonomous ride.
+    Steps {
+        steps: u32,
+        direction: Direction,
+        speed: f64,
         ttl_ms: u64,
     },
 }
@@ -197,41 +214,87 @@ impl CommandKind {
     pub fn name(&self) -> &'static str {
         match self {
             CommandKind::Stop => "stop",
-            CommandKind::WaitForLoad { .. } => "wait_for_load",
-            CommandKind::MoveTo { .. } => "move_to",
-            CommandKind::Continue { .. } => "continue",
+            CommandKind::Drive { .. } => "drive",
+            CommandKind::Steps { .. } => "steps",
         }
     }
+}
+
+// ---- fuel station (shotexpress/fuel/*) ----
+//
+// The refill dispenser at the bar is a second dumb executor on the same
+// broker, following the train's pattern: it receives a self-contained
+// `dispense` command, pours, and reports the outcome as lifecycle events.
+// The server choreographs refills (position the train with `steps`, then
+// dispense one glass at a time); the wire shape is fixed here even though
+// the server-side choreography lands later.
+
+pub const TOPIC_FUEL_COMMAND: &str = "shotexpress/fuel/command";
+pub const TOPIC_FUEL_EVENT: &str = "shotexpress/fuel/event";
+pub const TOPIC_FUEL_STATUS: &str = "shotexpress/fuel/status";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuelCommandMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub kind: FuelCommandKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MoveCommandParameters {
-    pub target: Target,
-    pub speed: f64,
-    pub direction: Direction,
-    pub expected_tags: Vec<String>,
-    pub stop_on_tag: String,
-    pub max_run_ms_without_tag: u64,
+#[serde(tag = "cmd_type", rename_all = "snake_case")]
+pub enum FuelCommandKind {
+    /// Pour `volume_ml` into whatever sits under the spout. Offline-
+    /// completable: once accepted, the pour finishes without connectivity.
+    Dispense { volume_ml: u32, ttl_ms: u64 },
+    /// Close the valve immediately (`cancelled` if a pour was active).
+    Stop,
+}
+
+/// Dispenser lifecycle events, mirroring the train's exec events (same
+/// envelope, same `exec_type` discriminator, minus `progress`).
+/// Well-known `ExecError::code` values: `TANK_EMPTY`, `POUR_TIMEOUT`,
+/// `NO_GLASS` (nothing under the spout, or the glass left mid-pour).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuelEvent {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    #[serde(flatten)]
+    pub kind: FuelEventKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "exec_type", rename_all = "snake_case")]
+pub enum FuelEventKind {
+    Accepted,
+    Completed,
+    Failed { error: ExecError },
+    Cancelled,
+    Expired,
+}
+
+impl FuelEventKind {
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, FuelEventKind::Accepted)
+    }
+}
+
+/// Fuel status heartbeat (1 Hz), like the train's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuelStatusMessage {
+    #[serde(flatten)]
+    pub envelope: Envelope,
+    pub state: FuelState,
+    /// Remaining reservoir, 0-100 (a rough estimate is fine).
+    pub tank_pct: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Target {
-    Bar,
-    Schachbrett,
-    ForgotName,
-    Raucherecke,
-}
-
-impl Target {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Target::Bar => "bar",
-            Target::Schachbrett => "schachbrett",
-            Target::ForgotName => "forgot_name",
-            Target::Raucherecke => "raucherecke",
-        }
-    }
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FuelState {
+    Idle,
+    Dispensing,
+    Error,
 }
 
 #[cfg(test)]
@@ -262,15 +325,14 @@ mod tests {
                 "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
                 "seq": 2, "ts_ms": 1751500000000u64,
                 "exec_type": "progress",
-                "direction": "forward"
+                "last_tag": "track12", "distance_m": 2.4
             }),
             json!({
                 "msg_id": "11111111-2222-4333-8444-555555555555",
                 "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
                 "seq": 3, "ts_ms": 1751500000000u64,
                 "exec_type": "progress",
-                "direction": "forward",
-                "progress": {"last_tag": "tag_03", "distance_m": 2.1}
+                "last_tag": "station2", "distance_m": 3.6, "skipped": 1
             }),
             json!({
                 "msg_id": "11111111-2222-4333-8444-555555555555",
@@ -283,7 +345,7 @@ mod tests {
                 "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
                 "seq": 5, "ts_ms": 1751500000000u64,
                 "exec_type": "failed",
-                "error": {"code": "UNROUTABLE", "reason": "unknown target"}
+                "error": {"code": "OVERSHOT", "reason": "missed stop tag station3"}
             }),
             json!({
                 "msg_id": "11111111-2222-4333-8444-555555555555",
@@ -312,8 +374,9 @@ mod tests {
         assert!(!ExecKind::Accepted.is_terminal());
         assert!(
             !ExecKind::Progress {
-                direction: Direction::Forward,
-                progress: None
+                last_tag: "track12".into(),
+                distance_m: 0.0,
+                skipped: 0
             }
             .is_terminal()
         );
@@ -405,12 +468,26 @@ mod tests {
     }
 
     #[test]
-    fn command_message_matches_ts_wire_format() {
-        // Golden shape mirroring webserver/lib/messages.ts createMoveCommand output
+    fn drive_command_golden_wire_shape() {
         let command = CommandMessage {
             envelope: envelope(),
-            kind: CommandKind::MoveTo {
-                params: default_move_parameters(),
+            kind: CommandKind::Drive {
+                legs: vec![
+                    Leg {
+                        tag: "track12".into(),
+                        speed: 0.8,
+                    },
+                    Leg {
+                        tag: "curveA2".into(),
+                        speed: 0.3,
+                    },
+                    Leg {
+                        tag: "station3".into(),
+                        speed: 0.25,
+                    },
+                ],
+                accel: 0.5,
+                max_run_ms_without_tag: 7_000,
                 ttl_ms: DEFAULT_TTL_MS,
             },
         };
@@ -419,25 +496,23 @@ mod tests {
             "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
             "seq": 3,
             "ts_ms": 1751500000000u64,
-            "cmd_type": "move_to",
-            "params": {
-                "target": "raucherecke",
-                "speed": 0.6,
-                "direction": "forward",
-                "expected_tags": ["tag_02", "tag_03", "tag_04", "tag_05", "tag_06"],
-                "stop_on_tag": "tag_07",
-                "max_run_ms_without_tag": 7000
-            },
+            "cmd_type": "drive",
+            "legs": [
+                {"tag": "track12", "speed": 0.8},
+                {"tag": "curveA2", "speed": 0.3},
+                {"tag": "station3", "speed": 0.25}
+            ],
+            "accel": 0.5,
+            "max_run_ms_without_tag": 7000,
             "ttl_ms": 60000
         });
         assert_eq!(serde_json::to_value(&command).unwrap(), expected);
 
-        // and deserializes back to the same wire shape (simulator's parse path)
         let parsed: CommandMessage = serde_json::from_value(expected.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), expected);
         assert!(matches!(
             parsed.kind,
-            CommandKind::MoveTo { ttl_ms: 60000, .. }
+            CommandKind::Drive { ttl_ms: 60000, .. }
         ));
     }
 
@@ -454,22 +529,18 @@ mod tests {
                 "msg_id": "11111111-2222-4333-8444-555555555555",
                 "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
                 "seq": 2, "ts_ms": 1751500000000u64,
-                "cmd_type": "wait_for_load",
-                "wait_time_ms": 5000, "ttl_ms": 15000
+                "cmd_type": "drive",
+                "legs": [],
+                "accel": 0.5,
+                "max_run_ms_without_tag": 7000,
+                "ttl_ms": 15000
             }),
             json!({
                 "msg_id": "11111111-2222-4333-8444-555555555555",
                 "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
                 "seq": 3, "ts_ms": 1751500000000u64,
-                "cmd_type": "continue",
-                "params": {
-                    "target": "bar",
-                    "speed": 0.4,
-                    "direction": "reverse",
-                    "expected_tags": ["tag_02"],
-                    "stop_on_tag": "tag_01",
-                    "max_run_ms_without_tag": 7000
-                },
+                "cmd_type": "steps",
+                "steps": 1000, "direction": "reverse", "speed": 0.2,
                 "ttl_ms": 15000
             }),
         ];
@@ -481,9 +552,101 @@ mod tests {
     }
 
     #[test]
+    fn fuel_command_golden_wire_shape() {
+        let command = FuelCommandMessage {
+            envelope: envelope(),
+            kind: FuelCommandKind::Dispense {
+                volume_ml: 40,
+                ttl_ms: 15_000,
+            },
+        };
+        let expected = json!({
+            "msg_id": "11111111-2222-4333-8444-555555555555",
+            "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "seq": 3,
+            "ts_ms": 1751500000000u64,
+            "cmd_type": "dispense",
+            "volume_ml": 40,
+            "ttl_ms": 15000
+        });
+        assert_eq!(serde_json::to_value(&command).unwrap(), expected);
+        let parsed: FuelCommandMessage = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), expected);
+
+        let stop = json!({
+            "msg_id": "11111111-2222-4333-8444-555555555555",
+            "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "seq": 4, "ts_ms": 1751500000000u64,
+            "cmd_type": "stop"
+        });
+        let parsed: FuelCommandMessage = serde_json::from_value(stop.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), stop);
+    }
+
+    #[test]
+    fn fuel_event_variants_round_trip() {
+        let cases = [
+            json!({
+                "msg_id": "11111111-2222-4333-8444-555555555555",
+                "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "seq": 1, "ts_ms": 1751500000000u64,
+                "exec_type": "accepted"
+            }),
+            json!({
+                "msg_id": "11111111-2222-4333-8444-555555555555",
+                "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "seq": 2, "ts_ms": 1751500000000u64,
+                "exec_type": "completed"
+            }),
+            json!({
+                "msg_id": "11111111-2222-4333-8444-555555555555",
+                "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "seq": 3, "ts_ms": 1751500000000u64,
+                "exec_type": "failed",
+                "error": {"code": "TANK_EMPTY", "reason": "reservoir below cutoff"}
+            }),
+            json!({
+                "msg_id": "11111111-2222-4333-8444-555555555555",
+                "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "seq": 4, "ts_ms": 1751500000000u64,
+                "exec_type": "cancelled"
+            }),
+            json!({
+                "msg_id": "11111111-2222-4333-8444-555555555555",
+                "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "seq": 5, "ts_ms": 1751500000000u64,
+                "exec_type": "expired"
+            }),
+        ];
+        for case in cases {
+            let event: FuelEvent = serde_json::from_value(case.clone())
+                .unwrap_or_else(|e| panic!("failed to parse {case}: {e}"));
+            let back = serde_json::to_value(&event).unwrap();
+            assert_eq!(back, case);
+            assert_eq!(
+                event.kind.is_terminal(),
+                !matches!(event.kind, FuelEventKind::Accepted)
+            );
+        }
+    }
+
+    #[test]
+    fn fuel_status_round_trip() {
+        let raw = json!({
+            "msg_id": "11111111-2222-4333-8444-555555555555",
+            "cmd_id": "",
+            "seq": 7, "ts_ms": 1751500000000u64,
+            "state": "DISPENSING", "tank_pct": 63
+        });
+        let status: FuelStatusMessage = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(status.state, FuelState::Dispensing);
+        assert_eq!(serde_json::to_value(&status).unwrap(), raw);
+    }
+
+    #[test]
     fn raw_and_garbage_payloads_fail_to_parse_as_commands() {
-        // the simulator falls back to the raw firmware protocol for these
-        for raw in ["0", "1", "2", "Alive", "", "{\"cmd_type\":\"fly\"}"] {
+        // the train falls back to the raw firmware protocol for these
+        for raw in ["0", "1", "2", "3", "Alive", "", "{\"cmd_type\":\"fly\"}"] {
             assert!(
                 serde_json::from_slice::<CommandMessage>(raw.as_bytes()).is_err(),
                 "{raw:?} should not parse as CommandMessage"

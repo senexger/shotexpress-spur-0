@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use tokio::sync::broadcast;
@@ -9,12 +9,16 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::types::{
     CmdId, CommandKind, CommandMessage, ConnectionState, ControllerSnapshot, Envelope, ExecEvent,
-    ManualAction, MoveCommandParameters, StatusMessage, TOPIC_COMMAND, TOPIC_EVENT_EXEC,
-    TOPIC_STATUS, TrainServiceEvent,
+    ExecKind, ManualAction, RawStatus, StatusMessage, TOPIC_COMMAND, TOPIC_EVENT_EXEC,
+    TOPIC_EVENT_TAG, TOPIC_STATUS, TagRead, TrainServiceEvent, now_ms,
 };
 
 const BROADCAST_CAPACITY: usize = 64;
 const RECONNECT_PERIOD: Duration = Duration::from_secs(2);
+/// The firmware heartbeats every 1 s (MQTT_PUBLISH_INTERVAL in Train.ino);
+/// 10 missed heartbeats means the train is gone.
+const TRAIN_OFFLINE_AFTER: Duration = Duration::from_secs(10);
+const LIVENESS_SWEEP_PERIOD: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum CommandError {
@@ -42,6 +46,18 @@ struct ServiceState {
     current_command_id: Option<Uuid>,
     seen_exec_msg_ids: HashSet<Uuid>,
     seq: u64,
+    /// Last two progress tags, oldest first — two consecutive reads pin the
+    /// train to a unique ring node (track.toml pairs are validated unique).
+    last_tags: (Option<String>, Option<String>),
+    /// Last raw read from the tag topic (setup aid, not localization).
+    last_tag_read: Option<TagRead>,
+    /// Last non-JSON status payload (legacy firmware "Alive" heartbeat).
+    last_raw_status: Option<RawStatus>,
+    /// Receive time of the last message from the train on any topic.
+    train_last_seen_ms: Option<u64>,
+    /// False until the first train message, and again once
+    /// TRAIN_OFFLINE_AFTER passes without one.
+    train_online: bool,
 }
 
 pub struct TrainService {
@@ -77,6 +93,11 @@ impl TrainService {
                 current_command_id: None,
                 seen_exec_msg_ids: HashSet::new(),
                 seq: 0,
+                last_tags: (None, None),
+                last_tag_read: None,
+                last_raw_status: None,
+                train_last_seen_ms: None,
+                train_online: false,
             }),
             tx,
         });
@@ -96,6 +117,35 @@ impl TrainService {
             events: state.events.clone(),
             is_busy: state.is_busy,
             error: state.error.clone(),
+            last_known_tag: state.last_tags.1.clone(),
+            last_tag_read: state.last_tag_read.clone(),
+            last_raw_status: state.last_raw_status.clone(),
+            train_online: state.train_online,
+        }
+    }
+
+    /// Any message from the train counts as a sign of life.
+    fn note_train_seen(&self, state: &mut ServiceState) {
+        state.train_last_seen_ms = Some(now_ms());
+        if !state.train_online {
+            state.train_online = true;
+            let _ = self.tx.send(TrainServiceEvent::Liveness(true));
+        }
+    }
+
+    /// Flip the train to dead if the heartbeat has been quiet too long.
+    fn check_liveness(&self) {
+        let mut state = self.lock();
+        if !state.train_online {
+            return;
+        }
+        let stale = match state.train_last_seen_ms {
+            Some(last_seen) => now_ms().saturating_sub(last_seen) > TRAIN_OFFLINE_AFTER.as_millis() as u64,
+            None => true,
+        };
+        if stale {
+            state.train_online = false;
+            let _ = self.tx.send(TrainServiceEvent::Liveness(false));
         }
     }
 
@@ -103,11 +153,14 @@ impl TrainService {
         self.tx.subscribe()
     }
 
-    pub fn send_move_command(
-        &self,
-        parameters: MoveCommandParameters,
-        ttl_ms: u64,
-    ) -> Result<(), CommandError> {
+    /// The last two progress tags (oldest first), for pinning the ring node.
+    pub fn last_tag_pair(&self) -> (Option<String>, Option<String>) {
+        self.lock().last_tags.clone()
+    }
+
+    /// Publish an acked command (drive / steps / stop) with a fresh cmd_id
+    /// and take the busy slot until its terminal exec event arrives.
+    pub fn send_command(&self, kind: CommandKind) -> Result<Uuid, CommandError> {
         let mut state = self.lock();
         if state.is_busy {
             return Err(CommandError::Busy);
@@ -125,10 +178,7 @@ impl TrainService {
                 seq: state.seq,
                 ts_ms: now_ms(),
             },
-            kind: CommandKind::MoveTo {
-                params: parameters,
-                ttl_ms,
-            },
+            kind,
         };
         let payload =
             serde_json::to_string(&command).expect("CommandMessage serialization cannot fail");
@@ -144,7 +194,7 @@ impl TrainService {
                 self.emit_events(&state);
                 self.set_busy(&mut state, true);
                 self.set_error(&mut state, None);
-                Ok(())
+                Ok(cmd_id)
             }
             Err(err) => {
                 let reason = err.to_string();
@@ -155,8 +205,12 @@ impl TrainService {
         }
     }
 
+    /// Publish a raw firmware command. Manual commands override whatever the
+    /// train is doing, so any in-flight acked command is abandoned: the busy
+    /// slot frees up immediately instead of waiting for a terminal exec event
+    /// that the overridden command may never produce.
     pub fn send_manual_command(&self, action: ManualAction) -> Result<(), CommandError> {
-        let state = self.lock();
+        let mut state = self.lock();
         if state.connection != ConnectionState::Connected {
             return Err(CommandError::NotConnected);
         }
@@ -167,7 +221,12 @@ impl TrainService {
                 false,
                 action.firmware_payload(),
             )
-            .map_err(|err| CommandError::Publish(err.to_string()))
+            .map_err(|err| CommandError::Publish(err.to_string()))?;
+
+        state.current_command_id = None;
+        self.set_busy(&mut state, false);
+        self.set_error(&mut state, None);
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, ServiceState> {
@@ -175,6 +234,10 @@ impl TrainService {
     }
 
     fn handle_publish(&self, topic: &str, payload: &[u8]) {
+        if matches!(topic, TOPIC_STATUS | TOPIC_EVENT_EXEC | TOPIC_EVENT_TAG) {
+            let mut state = self.lock();
+            self.note_train_seen(&mut state);
+        }
         match topic {
             TOPIC_STATUS => match serde_json::from_slice::<StatusMessage>(payload) {
                 Ok(status) if status.battery_pct <= 100 => {
@@ -188,8 +251,20 @@ impl TrainService {
                         "dropping status with out-of-range battery_pct"
                     );
                 }
-                Err(err) => {
-                    tracing::warn!(%err, payload = %String::from_utf8_lossy(payload), "failed to parse status payload");
+                Err(_) => {
+                    // legacy firmware heartbeats plain "Alive" — record it as
+                    // a raw status so the UI can at least show the train online
+                    let raw = String::from_utf8_lossy(payload).trim().to_string();
+                    if raw.is_empty() {
+                        return;
+                    }
+                    let status = RawStatus {
+                        raw,
+                        ts_ms: now_ms(),
+                    };
+                    let mut state = self.lock();
+                    state.last_raw_status = Some(status.clone());
+                    let _ = self.tx.send(TrainServiceEvent::RawStatus(status));
                 }
             },
             TOPIC_EVENT_EXEC => match serde_json::from_slice::<ExecEvent>(payload) {
@@ -198,6 +273,20 @@ impl TrainService {
                     tracing::warn!(%err, payload = %String::from_utf8_lossy(payload), "failed to parse exec event payload");
                 }
             },
+            TOPIC_EVENT_TAG => {
+                // raw uid string, no envelope — record verbatim with our clock
+                let tag = String::from_utf8_lossy(payload).trim().to_string();
+                if tag.is_empty() {
+                    return;
+                }
+                let read = TagRead {
+                    tag,
+                    ts_ms: now_ms(),
+                };
+                let mut state = self.lock();
+                state.last_tag_read = Some(read.clone());
+                let _ = self.tx.send(TrainServiceEvent::TagRead(read));
+            }
             other => {
                 tracing::debug!(topic = other, "ignoring message on unexpected topic");
             }
@@ -208,6 +297,20 @@ impl TrainService {
         let mut state = self.lock();
         if !state.seen_exec_msg_ids.insert(event.envelope.msg_id) {
             return;
+        }
+
+        // position tracking listens to every progress event, even from
+        // commands this server didn't send (e.g. a second admin instance)
+        if let ExecKind::Progress {
+            last_tag, skipped, ..
+        } = &event.kind
+        {
+            if *skipped > 0 {
+                // the missed reads break the consecutive-pair chain
+                state.last_tags = (None, Some(last_tag.clone()));
+            } else {
+                state.last_tags = (state.last_tags.1.take(), Some(last_tag.clone()));
+            }
         }
 
         if let Some(current) = state.current_command_id
@@ -263,6 +366,14 @@ impl TrainService {
     }
 }
 
+pub async fn run_liveness_sweep(service: Arc<TrainService>) {
+    let mut interval = tokio::time::interval(LIVENESS_SWEEP_PERIOD);
+    loop {
+        interval.tick().await;
+        service.check_liveness();
+    }
+}
+
 pub async fn run_event_loop(service: Arc<TrainService>, mut eventloop: EventLoop) {
     loop {
         match eventloop.poll().await {
@@ -277,6 +388,12 @@ pub async fn run_event_loop(service: Arc<TrainService>, mut eventloop: EventLoop
                     .try_subscribe(TOPIC_EVENT_EXEC, QoS::AtLeastOnce)
                 {
                     tracing::error!(%err, "failed to subscribe to exec event topic");
+                }
+                if let Err(err) = service
+                    .client
+                    .try_subscribe(TOPIC_EVENT_TAG, QoS::AtMostOnce)
+                {
+                    tracing::error!(%err, "failed to subscribe to tag event topic");
                 }
                 service.update_connection(ConnectionState::Connected);
                 service.set_error_standalone(None);
@@ -297,11 +414,4 @@ pub async fn run_event_loop(service: Arc<TrainService>, mut eventloop: EventLoop
             }
         }
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_millis() as u64
 }

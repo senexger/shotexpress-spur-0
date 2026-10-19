@@ -3,6 +3,17 @@ import { createTrainMqttClient, type TrainMqttClient } from "../mqttClient";
 import { createCommandMessage, createEnvelopeFactory, createMoveCommand } from "../messages";
 import type { ExecEvent, MoveCommandParameters, StatusMessage } from "../schemas";
 import type { ConnectionState, ControllerSnapshot } from "../controllerTypes";
+import { MQTT_TOPICS } from "../mqttTopics";
+
+// Raw integer protocol of the current Train.ino firmware:
+// 0 = stopMove(), 1 = move(1000 steps), 2 = runBackward() (continuous)
+export const MANUAL_ACTIONS = {
+  stop: "0",
+  steps: "1",
+  run: "2",
+} as const;
+
+export type ManualAction = keyof typeof MANUAL_ACTIONS;
 
 const FINAL_EVENT_TYPES: ExecEvent["exec_type"][] = ["completed", "failed", "cancelled", "expired"];
 const DEFAULT_TTL_MS = 60_000;
@@ -102,6 +113,13 @@ class TrainMqttService {
       this.setBusy(false);
       throw err;
     }
+  }
+
+  sendManualCommand(action: ManualAction): void {
+    if (this.connection !== "connected") {
+      throw new Error("MQTT connection not ready");
+    }
+    this.client.publish({ topic: MQTT_TOPICS.command, payload: MANUAL_ACTIONS[action] });
   }
 
   private attachClientListeners() {

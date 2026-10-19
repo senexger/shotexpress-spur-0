@@ -2,6 +2,7 @@ mod assets;
 mod config;
 mod routes;
 mod service;
+mod track;
 mod types;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -26,10 +27,29 @@ async fn main() -> ExitCode {
         }
     };
 
+    let track = match track::TrackConfig::load(&config.track_path) {
+        Ok(track) => track,
+        Err(err) => {
+            eprintln!("track config error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        path = %config.track_path.display(),
+        nodes = track.nodes.len(),
+        stations = track.stations.len(),
+        "track config loaded"
+    );
+
     let (service, eventloop) = service::TrainService::new(&config);
     tokio::spawn(service::run_event_loop(service.clone(), eventloop));
+    tokio::spawn(service::run_liveness_sweep(service.clone()));
 
-    let app = routes::router(service);
+    let app = routes::router(std::sync::Arc::new(routes::AppState {
+        service,
+        track: std::sync::RwLock::new(std::sync::Arc::new(track)),
+        track_path: config.track_path.clone(),
+    }));
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.http_port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
@@ -46,12 +66,15 @@ async fn main() -> ExitCode {
         config.mqtt_port
     );
 
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
+    // No graceful drain: SSE connections stay open indefinitely (heartbeats),
+    // so waiting for them would hang Ctrl+C. Abort serving right away instead.
+    let result = tokio::select! {
+        result = axum::serve(listener, app) => result,
+        _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
-        })
-        .await;
+            Ok(())
+        }
+    };
 
     match result {
         Ok(()) => ExitCode::SUCCESS,

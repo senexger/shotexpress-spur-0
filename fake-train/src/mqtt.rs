@@ -33,8 +33,23 @@ pub async fn run(client: AsyncClient, mut eventloop: EventLoop, tx: mpsc::Sender
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                // clean_session drops subscriptions; resubscribe on every ConnAck
-                let _ = client.try_subscribe(TOPIC_COMMAND, QoS::AtLeastOnce);
+                // clean_session drops subscriptions; resubscribe on every
+                // ConnAck. Spawned because the request channel may still hold
+                // a backlog that only this eventloop can drain — awaiting
+                // subscribe() inline would deadlock, and try_subscribe would
+                // fail silently, leaving the sim deaf to commands.
+                let subscribe_client = client.clone();
+                let subscribe_tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = subscribe_client
+                        .subscribe(TOPIC_COMMAND, QoS::AtLeastOnce)
+                        .await
+                    {
+                        let _ = subscribe_tx
+                            .send(MqttIn::Disconnected(format!("subscribe failed: {err}")))
+                            .await;
+                    }
+                });
                 if tx.send(MqttIn::Connected).await.is_err() {
                     return;
                 }

@@ -1,8 +1,12 @@
 # ShotExpress Control Server
 
-Single-binary Rust rewrite of the Next.js `webserver/`: serves the control dashboard
-(embedded static HTML/JS/CSS) and talks MQTT to the train. No Node, no build step —
-`cargo build --release` produces one self-contained binary.
+Single-binary Rust control server: serves the dashboard (static HTML/JS/CSS embedded
+at compile time from `assets/`), owns the track map, and talks MQTT to the train.
+No Node, no build step — `cargo build --release` produces one self-contained binary.
+
+The wire protocol lives in `../protocol/` (shared serde types + golden-shape tests);
+`../fake-train/` is the reference implementation of the train side. The old Next.js
+`webserver/` is kept only until the real train is verified against this server.
 
 ## Run
 
@@ -12,7 +16,9 @@ cargo run              # dev, http://localhost:3000
 cargo build --release  # binary at target/release/shotexpress-server
 ```
 
-The binary only needs a `.env` (or the env vars) next to it. `PORT` overrides the
+TODO: Why cant this be configured in a toml file?
+The binary needs a `.env` (or the env vars) next to it, plus a `track.toml`
+(path via `TRACK_CONFIG`, default repo-root `track.toml`). `PORT` overrides the
 HTTP port (default 3000). Logging via `RUST_LOG` (default `info`).
 
 Requires a running MQTT broker (see `../mqtt-broker/`). `MQTT_URL` must be plain
@@ -20,24 +26,39 @@ TCP (`mqtt://host:port`) — websocket URLs are not supported.
 
 ## API
 
-- `GET /` — dashboard (assets embedded at compile time from `assets/`)
-- `GET /api/train/state` — controller snapshot
-- `POST /api/train/command` — dispatch a `move_to` command; optional body
-  `{ttl_ms, parameters}` merged over defaults (409 when busy, 503 when disconnected)
-- `POST /api/train/manual` — `{action: "stop"|"steps"|"run"}`, published as the raw
-  `0`/`1`/`2` integers the current Train.ino firmware understands
+- `GET /` — dashboard (plus `/style.css`, `/app.js`)
+- `GET /api/train/state` — controller snapshot (`connection`, `lastStatus`, `events`,
+  `isBusy`, `error`, `lastKnownTag`, `lastTagRead`)
+- `POST /api/train/command` — `{target, speed?, ttl_ms?}`: compiles a `drive` leg
+  schedule from `track.toml` to the named station (409 when busy, 503 when disconnected)
+- `POST /api/train/steps` — `{direction, steps?, speed?, ttl_ms?}`: precise positioning
+  nudge for refill; defaults come from `[refill]` in `track.toml`
+- `POST /api/train/manual` — `{action: "stop"|"steps"|"forward"|"backward"}`, published
+  as raw firmware integers `0`/`1`/`3`/`2` (Train.ino: stopMove, move 1000 steps,
+  runForward, runBackward). Debug/setup only — no cmd_id, no exec events
 - `GET /api/train/stream` — SSE stream of service events (snapshot first, 25 s heartbeat)
+- `GET /api/track` — track summary (train params, refill, stations, ring order)
+- `POST /api/admin/track/reload` — re-read and validate `track.toml` without restart
 
 ## Protocol notes
 
-- Wire shapes follow `webserver/lib/schemas.ts` (`exec_type` discriminator); the root
-  README's spec is stale where it says `event_type`/`started` — do not "fix" the code
-  toward it.
-- Unparseable MQTT payloads (e.g. the firmware's literal `Alive` status) are logged
-  and dropped, matching the old zod behavior.
-- The TS simulator remains the protocol oracle: `pnpm --dir ../webserver fake:train`.
+- Source of truth for wire shapes is the `shotexpress-protocol` crate (`exec_type` /
+  `cmd_type` discriminators); the fake-train simulator is the behavioral oracle:
+  `cargo run -p fake-train`.
+- Unparseable MQTT payloads (e.g. the current firmware's literal `Alive` status) are
+  logged and dropped.
+- `shotexpress/event/tag` carries every raw RFID read as a bare uid string (no JSON,
+  works with the current Train.ino). The server surfaces it as `lastTagRead` in the
+  snapshot and as a `tag` SSE event — a setup aid for mapping physical tags to
+  `track.toml` names. It is *not* used for localization (that stays on consecutive
+  progress-tag pairs, which are forward-only by construction).
+- The fuel station (refill dispenser) speaks the same envelope pattern on
+  `shotexpress/fuel/command` / `shotexpress/fuel/event` / `shotexpress/fuel/status`;
+  types are in the protocol crate, firmware guide in `../fuel-station/README.md`.
+  The server does not drive it yet.
 
 ## Testing
 
-`cargo test` covers the serde wire formats, including a golden `move_to` fixture
-generated from the TS `createMoveCommand` implementation.
+`cargo test --workspace` covers the serde wire formats (golden fixtures in the
+protocol crate), track validation/route compilation against the repo `track.toml`,
+and the simulator's command semantics.

@@ -4,11 +4,11 @@
 //! pass), loop A. Main-line tags therefore appear at two ring nodes, curve
 //! tags at one.
 //!
-//! Motor `Direction::Forward` moves the ring coordinate up; crossing into
-//! node `j` emits reading `READINGS[j]`. `RingPos { edge, frac }` is a point
-//! on edge `edge`, which connects node `edge` to node `(edge + 1) % NODES`.
-
-use shotexpress_protocol::{Direction, Target};
+//! The train can only run forward — the passive switches make every lap take
+//! the same route — so motion is always increasing ring index. Crossing into
+//! node `j` emits reading `READINGS[j]`, and the train is then on edge `j`.
+//! `RingPos { edge, frac }` is a point on edge `edge`, which connects node
+//! `edge` to node `(edge + 1) % NODES`.
 
 pub const NODES: usize = 14;
 
@@ -23,6 +23,9 @@ pub const READINGS: [&str; NODES] = [
 pub struct Edge {
     pub nominal_ms: u64,
     pub len_m: f64,
+    /// Turnaround curve — speeds come from the drive legs, so runtime code
+    /// never reads this; the worst-tag-gap test does.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub crawl: bool,
 }
 
@@ -63,8 +66,9 @@ pub const EDGES: [Edge; NODES] = [
     LOOP_LINK,  // 13 curveA2  -> station1
 ];
 
-/// Speed forced on crawl edges (curve tags "reduce the train speed") and in
-/// APPROACH state.
+/// Slowest speed a sane leg schedule commands on the turnaround edges —
+/// mirrors the `speed_limit = 0.5` on the curve nodes in track.toml.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const CRAWL_SPEED: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,45 +81,16 @@ pub fn nodes_for_tag(tag: &str) -> Vec<usize> {
     (0..NODES).filter(|&i| READINGS[i] == tag).collect()
 }
 
-/// The node the train crosses next when moving from `edge` in `dir`.
-pub fn next_node(edge: usize, dir: Direction) -> usize {
-    match dir {
-        Direction::Forward => (edge + 1) % NODES,
-        Direction::Reverse => edge,
-    }
+/// The node the train crosses next from `edge` (always running forward).
+pub fn next_node(edge: usize) -> usize {
+    (edge + 1) % NODES
 }
 
-/// The edge the train is on after crossing node `node` moving in `dir`.
-pub fn edge_after_crossing(node: usize, dir: Direction) -> usize {
-    match dir {
-        Direction::Forward => node,
-        Direction::Reverse => (node + NODES - 1) % NODES,
-    }
-}
-
-/// Given two consecutive readings with an unchanged motor direction, the
-/// train's edge is uniquely determined: all (prev, cur) pairs are distinct
-/// within each direction (asserted by test).
-pub fn localize(prev: &str, cur: &str, dir: Direction) -> Option<usize> {
-    (0..NODES).find_map(|j| {
-        let prev_node = match dir {
-            Direction::Forward => (j + NODES - 1) % NODES,
-            Direction::Reverse => (j + 1) % NODES,
-        };
-        (READINGS[prev_node] == prev && READINGS[j] == cur).then(|| edge_after_crossing(j, dir))
-    })
-}
-
-/// Station routing for move_to commands: literal expected_tags/stop_on_tag in
-/// the command are ignored (the server defaults still name tag_02..tag_07);
-/// only the target matters.
-pub fn station_tag(target: Target) -> Option<&'static str> {
-    match target {
-        Target::Bar => Some("station1"),
-        Target::Schachbrett => Some("station2"),
-        Target::Raucherecke => Some("station3"),
-        Target::ForgotName => None,
-    }
+/// Given two consecutive readings, the train's edge is uniquely determined:
+/// all (prev, cur) reading pairs on the ring are distinct (asserted by test).
+/// Crossing node `j` puts the train on edge `j`.
+pub fn localize(prev: &str, cur: &str) -> Option<usize> {
+    (0..NODES).find(|&j| READINGS[(j + NODES - 1) % NODES] == prev && READINGS[j] == cur)
 }
 
 #[cfg(test)]
@@ -125,37 +100,22 @@ mod tests {
 
     #[test]
     #[allow(clippy::needless_range_loop)]
-    fn reading_pairs_are_unique_per_direction() {
-        for dir in [Direction::Forward, Direction::Reverse] {
-            let mut seen = HashSet::new();
-            for j in 0..NODES {
-                let prev_node = match dir {
-                    Direction::Forward => (j + NODES - 1) % NODES,
-                    Direction::Reverse => (j + 1) % NODES,
-                };
-                let pair = (READINGS[prev_node], READINGS[j]);
-                assert!(seen.insert(pair), "duplicate pair {pair:?} for {dir:?}");
-            }
+    fn reading_pairs_are_unique() {
+        let mut seen = HashSet::new();
+        for j in 0..NODES {
+            let pair = (READINGS[(j + NODES - 1) % NODES], READINGS[j]);
+            assert!(seen.insert(pair), "duplicate pair {pair:?}");
         }
     }
 
     #[test]
-    fn localize_finds_unique_edge_in_both_directions() {
+    fn localize_finds_unique_edge() {
         // eastbound: passed track12 after station1 -> on edge 1
-        assert_eq!(localize("station1", "track12", Direction::Forward), Some(1));
+        assert_eq!(localize("station1", "track12"), Some(1));
         // westbound pass of the same tags: station2 then track12 -> edge 10
-        assert_eq!(
-            localize("station2", "track12", Direction::Forward),
-            Some(10)
-        );
-        // reverse motor: reading station1 after track12 while reversing
-        // means we crossed node 0 downwards -> now on edge 13
-        assert_eq!(
-            localize("track12", "station1", Direction::Reverse),
-            Some(13)
-        );
+        assert_eq!(localize("station2", "track12"), Some(10));
         // nonsense pair
-        assert_eq!(localize("station1", "station3", Direction::Forward), None);
+        assert_eq!(localize("station1", "station3"), None);
     }
 
     #[test]
@@ -178,8 +138,8 @@ mod tests {
             })
             .max()
             .unwrap();
-        let default_timeout =
-            shotexpress_protocol::default_move_parameters().max_run_ms_without_tag;
+        // mirrors [train] max_run_ms_without_tag in track.toml
+        let default_timeout = 7_000;
         assert!(
             worst_ms < default_timeout,
             "worst gap {worst_ms} ms would trip the {default_timeout} ms RFID timeout"
@@ -187,14 +147,13 @@ mod tests {
     }
 
     #[test]
-    fn ring_walk_covers_all_nodes() {
-        // forward walk from any edge passes every reading exactly once per lap
+    fn forward_walk_covers_all_nodes() {
         let mut edge = 3;
         let mut seen = Vec::new();
         for _ in 0..NODES {
-            let node = next_node(edge, Direction::Forward);
+            let node = next_node(edge);
             seen.push(node);
-            edge = edge_after_crossing(node, Direction::Forward);
+            edge = node;
         }
         let mut sorted = seen.clone();
         sorted.sort();
