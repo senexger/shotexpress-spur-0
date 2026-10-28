@@ -9,8 +9,10 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::types::{
     CmdId, CommandKind, CommandMessage, ConnectionState, ControllerSnapshot, Envelope, ExecEvent,
-    ExecKind, ManualAction, RawStatus, StatusMessage, TOPIC_COMMAND, TOPIC_EVENT_EXEC,
-    TOPIC_EVENT_TAG, TOPIC_STATUS, TagRead, TrainServiceEvent, now_ms,
+    ExecKind, FuelCommandKind, FuelCommandMessage, FuelEvent, FuelStatusMessage, ManualAction,
+    RawStatus, StatusMessage, TOPIC_COMMAND, TOPIC_EVENT_EXEC, TOPIC_EVENT_TAG,
+    TOPIC_FUEL_COMMAND, TOPIC_FUEL_EVENT, TOPIC_FUEL_SENSOR, TOPIC_FUEL_STATUS, TOPIC_ACCEL, TOPIC_SPEED, TOPIC_STATUS,
+    TOPIC_STEPS, TagRead, TrainServiceEvent, now_ms,
 };
 
 const BROADCAST_CAPACITY: usize = 64;
@@ -19,6 +21,16 @@ const RECONNECT_PERIOD: Duration = Duration::from_secs(2);
 /// 10 missed heartbeats means the train is gone.
 const TRAIN_OFFLINE_AFTER: Duration = Duration::from_secs(10);
 const LIVENESS_SWEEP_PERIOD: Duration = Duration::from_secs(1);
+/// Matches MAX_SPEED_HZ in Train.ino (the firmware clamps too).
+pub const MAX_SPEED_HZ: u32 = 20_000;
+/// Sanity cap for one manual move, either direction.
+pub const MAX_MOVE_STEPS: i32 = 1_000_000;
+/// Sanity cap for the start acceleration (steps/s²).
+pub const MAX_ACCEL: u32 = 1_000_000;
+/// Sanity cap for one pour; the station's own pour-time cap is stricter.
+pub const MAX_FILL_ML: u32 = 500;
+/// A pour command older than this is dropped by the station (`expired`).
+pub const FUEL_TTL_MS: u64 = 15_000;
 
 #[derive(Debug)]
 pub enum CommandError {
@@ -58,6 +70,12 @@ struct ServiceState {
     /// False until the first train message, and again once
     /// TRAIN_OFFLINE_AFTER passes without one.
     train_online: bool,
+    /// Last value seen on the retained speed topic.
+    speed_hz: Option<u32>,
+    accel: Option<u32>,
+    fuel_last_event: Option<FuelEvent>,
+    fuel_status: Option<FuelStatusMessage>,
+    fuel_distance_mm: Option<i32>,
 }
 
 pub struct TrainService {
@@ -98,6 +116,11 @@ impl TrainService {
                 last_raw_status: None,
                 train_last_seen_ms: None,
                 train_online: false,
+                speed_hz: None,
+                accel: None,
+                fuel_last_event: None,
+                fuel_status: None,
+                fuel_distance_mm: None,
             }),
             tx,
         });
@@ -121,6 +144,11 @@ impl TrainService {
             last_tag_read: state.last_tag_read.clone(),
             last_raw_status: state.last_raw_status.clone(),
             train_online: state.train_online,
+            speed_hz: state.speed_hz,
+            accel: state.accel,
+            fuel_last_event: state.fuel_last_event.clone(),
+            fuel_status: state.fuel_status.clone(),
+            fuel_distance_mm: state.fuel_distance_mm,
         }
     }
 
@@ -156,6 +184,33 @@ impl TrainService {
     /// The last two progress tags (oldest first), for pinning the ring node.
     pub fn last_tag_pair(&self) -> (Option<String>, Option<String>) {
         self.lock().last_tags.clone()
+    }
+
+    /// Publish a fuel station command (dispense / stop) with a fresh cmd_id.
+    /// Test setup: no busy interlock with the train yet; the UI just shows
+    /// whatever the station reports back.
+    pub fn send_fuel_command(&self, kind: FuelCommandKind) -> Result<Uuid, CommandError> {
+        let mut state = self.lock();
+        if state.connection != ConnectionState::Connected {
+            return Err(CommandError::NotConnected);
+        }
+        let cmd_id = Uuid::new_v4();
+        state.seq += 1;
+        let command = FuelCommandMessage {
+            envelope: Envelope {
+                msg_id: Uuid::new_v4(),
+                cmd_id: CmdId::Id(cmd_id),
+                seq: state.seq,
+                ts_ms: now_ms(),
+            },
+            kind,
+        };
+        let payload =
+            serde_json::to_string(&command).expect("FuelCommandMessage serialization cannot fail");
+        self.client
+            .try_publish(TOPIC_FUEL_COMMAND, QoS::AtLeastOnce, false, payload)
+            .map_err(|err| CommandError::Publish(err.to_string()))?;
+        Ok(cmd_id)
     }
 
     /// Publish an acked command (drive / steps / stop) with a fresh cmd_id
@@ -210,18 +265,48 @@ impl TrainService {
     /// slot frees up immediately instead of waiting for a terminal exec event
     /// that the overridden command may never produce.
     pub fn send_manual_command(&self, action: ManualAction) -> Result<(), CommandError> {
+        self.publish_raw(&[(TOPIC_COMMAND, action.firmware_payload().to_string(), false)])
+    }
+
+    /// Set the max speed (retained, raw steps/s) and drive forward with it.
+    /// Test setup: speed comes from the UI, not track.toml.
+    /// Optionally sets the acceleration first.
+    pub fn send_speed(&self, hz: u32, accel: Option<u32>) -> Result<(), CommandError> {
+        let mut messages = settings_messages(Some(hz), accel);
+        messages.push((TOPIC_COMMAND, ManualAction::Forward.firmware_payload().to_string(), false));
+        self.publish_raw(&messages)
+    }
+
+    /// Move a relative number of steps (negative = backward), optionally
+    /// setting the speed and acceleration first.
+    pub fn send_move(
+        &self,
+        steps: i32,
+        hz: Option<u32>,
+        accel: Option<u32>,
+    ) -> Result<(), CommandError> {
+        let mut messages = settings_messages(hz, accel);
+        messages.push((TOPIC_STEPS, steps.to_string(), false));
+        self.publish_raw(&messages)
+    }
+
+    /// Set the start acceleration (retained) without moving the train.
+    pub fn send_accel(&self, accel: u32) -> Result<(), CommandError> {
+        self.publish_raw(&settings_messages(None, Some(accel)))
+    }
+
+    /// Publish raw firmware messages in order. Like every manual command
+    /// this abandons any in-flight acked command (see send_manual_command).
+    fn publish_raw(&self, messages: &[(&str, String, bool)]) -> Result<(), CommandError> {
         let mut state = self.lock();
         if state.connection != ConnectionState::Connected {
             return Err(CommandError::NotConnected);
         }
-        self.client
-            .try_publish(
-                TOPIC_COMMAND,
-                QoS::AtLeastOnce,
-                false,
-                action.firmware_payload(),
-            )
-            .map_err(|err| CommandError::Publish(err.to_string()))?;
+        for (topic, payload, retain) in messages {
+            self.client
+                .try_publish(*topic, QoS::AtLeastOnce, *retain, payload.clone())
+                .map_err(|err| CommandError::Publish(err.to_string()))?;
+        }
 
         state.current_command_id = None;
         self.set_busy(&mut state, false);
@@ -286,6 +371,51 @@ impl TrainService {
                 let mut state = self.lock();
                 state.last_tag_read = Some(read.clone());
                 let _ = self.tx.send(TrainServiceEvent::TagRead(read));
+            }
+            TOPIC_FUEL_EVENT => match serde_json::from_slice::<FuelEvent>(payload) {
+                Ok(event) => {
+                    self.lock().fuel_last_event = Some(event.clone());
+                    let _ = self.tx.send(TrainServiceEvent::FuelEvent(event));
+                }
+                Err(err) => {
+                    tracing::warn!(%err, payload = %String::from_utf8_lossy(payload), "failed to parse fuel event");
+                }
+            },
+            TOPIC_FUEL_STATUS => match serde_json::from_slice::<FuelStatusMessage>(payload) {
+                Ok(status) => {
+                    self.lock().fuel_status = Some(status.clone());
+                    let _ = self.tx.send(TrainServiceEvent::FuelStatus(status));
+                }
+                Err(err) => {
+                    tracing::warn!(%err, payload = %String::from_utf8_lossy(payload), "failed to parse fuel status");
+                }
+            },
+            TOPIC_FUEL_SENSOR => {
+                let raw = String::from_utf8_lossy(payload);
+                let Ok(mm) = raw.trim().parse::<i32>() else {
+                    tracing::warn!(payload = %raw, "ignoring non-integer fuel sensor payload");
+                    return;
+                };
+                self.lock().fuel_distance_mm = Some(mm);
+                let _ = self.tx.send(TrainServiceEvent::FuelDistance(mm));
+            }
+            TOPIC_ACCEL => {
+                let raw = String::from_utf8_lossy(payload);
+                let Ok(accel) = raw.trim().parse::<u32>() else {
+                    tracing::warn!(payload = %raw, "ignoring non-integer accel payload");
+                    return;
+                };
+                self.lock().accel = Some(accel);
+                let _ = self.tx.send(TrainServiceEvent::Accel(accel));
+            }
+            TOPIC_SPEED => {
+                let raw = String::from_utf8_lossy(payload);
+                let Ok(hz) = raw.trim().parse::<u32>() else {
+                    tracing::warn!(payload = %raw, "ignoring non-integer speed payload");
+                    return;
+                };
+                self.lock().speed_hz = Some(hz);
+                let _ = self.tx.send(TrainServiceEvent::Speed(hz));
             }
             other => {
                 tracing::debug!(topic = other, "ignoring message on unexpected topic");
@@ -366,6 +496,19 @@ impl TrainService {
     }
 }
 
+/// Retained speed/accel settings, published before a raw command so the
+/// train applies them first.
+fn settings_messages(hz: Option<u32>, accel: Option<u32>) -> Vec<(&'static str, String, bool)> {
+    let mut messages = Vec::new();
+    if let Some(accel) = accel {
+        messages.push((TOPIC_ACCEL, accel.to_string(), true));
+    }
+    if let Some(hz) = hz {
+        messages.push((TOPIC_SPEED, hz.to_string(), true));
+    }
+    messages
+}
+
 pub async fn run_liveness_sweep(service: Arc<TrainService>) {
     let mut interval = tokio::time::interval(LIVENESS_SWEEP_PERIOD);
     loop {
@@ -394,6 +537,17 @@ pub async fn run_event_loop(service: Arc<TrainService>, mut eventloop: EventLoop
                     .try_subscribe(TOPIC_EVENT_TAG, QoS::AtMostOnce)
                 {
                     tracing::error!(%err, "failed to subscribe to tag event topic");
+                }
+                for (topic, qos) in [
+                    (TOPIC_SPEED, QoS::AtMostOnce),
+                    (TOPIC_ACCEL, QoS::AtMostOnce),
+                    (TOPIC_FUEL_EVENT, QoS::AtLeastOnce),
+                    (TOPIC_FUEL_STATUS, QoS::AtMostOnce),
+                    (TOPIC_FUEL_SENSOR, QoS::AtMostOnce),
+                ] {
+                    if let Err(err) = service.client.try_subscribe(topic, qos) {
+                        tracing::error!(%err, topic, "failed to subscribe");
+                    }
                 }
                 service.update_connection(ConnectionState::Connected);
                 service.set_error_standalone(None);

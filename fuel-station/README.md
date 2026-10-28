@@ -33,6 +33,7 @@ Username `admin`, Passwort `123`. Client-ID z. B. `"fuel-station"`.
 | `shotexpress/fuel/command` | du **abonnierst** | Kommandos vom Server (JSON) |
 | `shotexpress/fuel/event` | du **veröffentlichst** | Lebenszyklus-Antworten (JSON) |
 | `shotexpress/fuel/status` | du **veröffentlichst** | Heartbeat, 1× pro Sekunde (JSON) |
+| `shotexpress/fuel/sensor` | du **veröffentlichst** | Ultraschall-Abstand in mm, reine Zahl (kein JSON), ~4× pro Sekunde, `-1` = kein Echo — nur zur Anzeige im Web-UI |
 
 ## Kommandos (kommen rein)
 
@@ -114,17 +115,23 @@ während eines Gusses die aktive `cmd_id`). `state` ist `IDLE`,
 ## Code
 
 Die Referenz-Implementierung liegt hier im Ordner: **`fuel-station.ino`**
-(kompiliert für `esp32:esp32:esp32doit-devkit-v1`, gleiche Struktur wie
+(kompiliert für den ESP32-C3: `esp32:esp32:esp32c3:CDCOnBoot=cdc`, gleiche Struktur wie
 `Train/Train.ino` inkl. Telnet-Debug-Konsole auf Port 23). Bibliotheken:
 „MQTT" (256dpi) und „ArduinoJson" aus dem Library Manager.
 
-Deine Baustellen sind im Sketch als Abschnitt **„dummy hardware"**
-markiert: `pumpOn()`/`pumpOff()` (Relais ansteuern, ggf. active-low) und
-`readDistanceMm()` (echter Ultraschall-Read statt Dummy-Wert). Alles
-andere — MQTT, JSON, Zustandsautomat, TTL, Duplikate, Offline-Queue,
-Watchdog — ist fertig. Dazu die Konstanten oben kalibrieren: `MS_PER_ML`
-(gießen und messen), `GLASS_PRESENT_MM` (Abstand Sensor → Glasrand),
-`TANK_CAPACITY_ML` und die Pin-Nummern.
+Die Hardware ist im Abschnitt **„hardware"** schon verdrahtet (übernommen
+aus `fuel-station-old/UltraschallPimpe.ino`): Pumpe über IRLZ34N-MOSFET
+(Low-side) an GPIO19, HC-SR04 mit TRIG=4 und ECHO=5. Liefert der Sensor kein
+Echo, gilt das als „kein Glas" — gegossen wird nur mit gültiger Messung.
+Während des Gießens bricht erst der 3. Fehl-Read in Folge den Guss ab
+(`NO_GLASS_ABORT_READS`), weil Ultraschall gelegentlich ein Echo verliert.
+
+Noch zu kalibrieren: `MS_PER_ML` (gießen und messen), `GLASS_PRESENT_MM`
+(Abstand Sensor → Glas, aktuell 200 mm wie im alten Sketch) und
+`TANK_CAPACITY_ML`.
+
+**Achtung:** Der ECHO-Pin des HC-SR04 liefert 5 V, der ESP32 verträgt nur
+3,3 V — ein Spannungsteiler am ECHO-Pin wird empfohlen.
 
 Daneben gehört eine `credentials.h` mit `SECRET_SSID`/`SECRET_PASS`
 (einfach die aus `Train/` kopieren, ist absichtlich nicht im Git).

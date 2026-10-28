@@ -20,6 +20,17 @@ pub const TOPIC_EVENT_EXEC: &str = "shotexpress/event/exec";
 /// Setup aid for mapping physical tag uids to track.toml names; the server
 /// must not use it for localization (backward moves produce reversed pairs).
 pub const TOPIC_EVENT_TAG: &str = "shotexpress/event/tag";
+/// Max stepper speed for the raw firmware commands, as a plain-text integer
+/// in steps/s — no JSON, no envelope. Published retained by the server so
+/// the train picks the last value up again after a reboot. Test setup.
+pub const TOPIC_SPEED: &str = "shotexpress/speed";
+/// Relative move for the raw firmware, as a plain-text signed integer in
+/// steps (negative = backward), at the current speed. Not retained: it is
+/// an action, not a setting. Test setup.
+pub const TOPIC_STEPS: &str = "shotexpress/steps";
+/// Start acceleration for the raw firmware, plain-text integer in steps/s².
+/// Retained like the speed. Stops stay instant. Test setup.
+pub const TOPIC_ACCEL: &str = "shotexpress/accel";
 
 pub const DEFAULT_TTL_MS: u64 = 60_000;
 
@@ -232,6 +243,10 @@ impl CommandKind {
 pub const TOPIC_FUEL_COMMAND: &str = "shotexpress/fuel/command";
 pub const TOPIC_FUEL_EVENT: &str = "shotexpress/fuel/event";
 pub const TOPIC_FUEL_STATUS: &str = "shotexpress/fuel/status";
+/// Raw ultrasonic distance in mm as a plain-text integer (-1 = no echo),
+/// about 4 Hz, no envelope. Diagnostics only (watch a glass fill,
+/// calibrate thresholds), like the train's raw tag topic.
+pub const TOPIC_FUEL_SENSOR: &str = "shotexpress/fuel/sensor";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuelCommandMessage {

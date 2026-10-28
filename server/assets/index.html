@@ -37,8 +37,65 @@
         <div class="manualButtonRow">
           <button id="manual-backward" class="button" data-action="backward">◀ Backward</button>
           <button id="manual-steps" class="button" data-action="steps">Steps ×1000</button>
-          <button id="manual-forward" class="button" data-action="forward">Forward ▶</button>
           <button id="manual-stop" class="button buttonDanger" data-action="stop">■ Stop</button>
+        </div>
+        <p class="mutedText speedLabel">
+          Forward ▶ at speed (1 = 2000 … 10 = 20000 steps/s). Also sets the
+          speed for Backward and Steps. Current: <span id="speed-current" class="valueText">—</span>,
+          acceleration <span id="accel-current" class="valueText">—</span>
+        </p>
+        <div id="speed-buttons" class="manualButtonRow"></div>
+        <div class="manualInputRow">
+          <label class="manualInput">
+            Speed (steps/s)
+            <input id="typed-hz" type="number" min="1" max="20000" step="100" value="3000">
+          </label>
+          <label class="manualInput">
+            Steps (negative = backward)
+            <input id="typed-steps" type="number" min="-1000000" max="1000000" step="100" value="1000">
+          </label>
+          <label class="manualInput">
+            Acceleration (steps/s²)
+            <input id="typed-accel" type="number" min="1" max="1000000" step="100" value="500">
+          </label>
+        </div>
+        <div class="manualButtonRow">
+          <button id="fire-speed" class="button">Forward ▶ at typed speed</button>
+          <button id="fire-steps" class="button">Move typed steps at typed speed</button>
+          <button id="fire-accel" class="button">Set acceleration only</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="sectionTitle">Fuel Station</h2>
+        <p class="mutedText">
+          Pours the typed amount into the glass under the spout. The station
+          refuses without a glass and caps one pour at 10 s of pumping.
+        </p>
+        <p class="mutedText">
+          Station: <span id="fuel-state" class="valueText">no heartbeat yet</span><br>
+          Last reply: <span id="fuel-last-event" class="valueText">—</span>
+        </p>
+        <p class="mutedText">
+          Ultrasonic: <span id="fuel-distance" class="fuelDistance">—</span>
+          <span id="fuel-glass" class="valueText"></span>
+        </p>
+        <svg id="fuel-chart" class="fuelChart" viewBox="0 0 300 60" preserveAspectRatio="none"
+             role="img" aria-label="Ultrasonic distance, last 30 seconds">
+          <polyline id="fuel-chart-line" fill="none" stroke="currentColor" stroke-width="2"
+                    vector-effect="non-scaling-stroke" points=""></polyline>
+        </svg>
+        <p class="mutedText fuelChartCaption">Last 30 s · <span id="fuel-chart-range">—</span></p>
+        <p id="fuel-error" class="warningBox sectionError" hidden></p>
+        <div class="manualInputRow">
+          <label class="manualInput">
+            Amount (ml)
+            <input id="typed-ml" type="number" min="1" max="500" step="1" value="20">
+          </label>
+        </div>
+        <div class="manualButtonRow">
+          <button id="fuel-fill" class="button">Fill</button>
+          <button id="fuel-stop" class="button buttonDanger">■ Stop pour</button>
         </div>
       </section>
 

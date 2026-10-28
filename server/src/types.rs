@@ -34,6 +34,16 @@ pub struct ControllerSnapshot {
     /// False until the train's first message, and again once the heartbeat
     /// goes quiet for longer than the offline timeout.
     pub train_online: bool,
+    /// Last speed on shotexpress/speed (retained, so it survives restarts).
+    pub speed_hz: Option<u32>,
+    /// Last acceleration on shotexpress/accel (retained, steps/s²).
+    pub accel: Option<u32>,
+    /// Last lifecycle event from the fuel station (any command).
+    pub fuel_last_event: Option<FuelEvent>,
+    /// Last fuel station heartbeat.
+    pub fuel_status: Option<FuelStatusMessage>,
+    /// Last raw ultrasonic distance in mm (-1 = no echo).
+    pub fuel_distance_mm: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +75,11 @@ pub enum TrainServiceEvent {
     TagRead(TagRead),
     RawStatus(RawStatus),
     Liveness(bool),
+    Speed(u32),
+    Accel(u32),
+    FuelEvent(FuelEvent),
+    FuelStatus(FuelStatusMessage),
+    FuelDistance(i32),
 }
 
 // ---- HTTP request bodies ----
@@ -155,6 +170,11 @@ mod tests {
                     last_tag_read: None,
                     last_raw_status: None,
                     train_online: false,
+                    speed_hz: None,
+                    accel: None,
+                    fuel_last_event: None,
+                    fuel_status: None,
+                    fuel_distance_mm: None,
                 }),
                 json!({"type": "snapshot", "payload": {
                     "connection": "connecting",
@@ -165,8 +185,17 @@ mod tests {
                     "lastKnownTag": null,
                     "lastTagRead": null,
                     "lastRawStatus": null,
-                    "trainOnline": false
+                    "trainOnline": false,
+                    "speedHz": null,
+                    "accel": null,
+                    "fuelLastEvent": null,
+                    "fuelStatus": null,
+                    "fuelDistanceMm": null
                 }}),
+            ),
+            (
+                TrainServiceEvent::Speed(5000),
+                json!({"type": "speed", "payload": 5000}),
             ),
             (
                 TrainServiceEvent::Liveness(true),

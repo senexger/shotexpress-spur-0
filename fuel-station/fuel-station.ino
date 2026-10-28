@@ -6,22 +6,34 @@
 
 // Fuel station: dumb executor for shotexpress/fuel/command (see
 // ../fuel-station/README.md and protocol/src/lib.rs, "fuel station").
-// One relay drives the pump, one ultrasonic sensor checks for a glass.
+// Hardware as in ../fuel-station-old/UltraschallPimpe.ino: the pump hangs on
+// an IRLZ34N low-side MOSFET, an HC-SR04 ultrasonic sensor checks for a glass.
 
-constexpr int RELAY_PIN = 26;
-constexpr int TRIG_PIN = 25;
-constexpr int ECHO_PIN = 33;
+constexpr int PUMP_PIN = 19; // MOSFET gate, HIGH = pump on
+constexpr int TRIG_PIN = 4;
+constexpr int ECHO_PIN = 5;
 
 constexpr unsigned long WIFI_RETRY_INTERVAL = 5000;
+constexpr unsigned long WIFI_RESTART_INTERVAL = 20000;
+// ESP32-C3 boards with a small onboard antenna often fail to join at full
+// power (disconnect reason 2, AUTH_EXPIRE). Lower TX power fixes it; must be
+// set after every WiFi.begin().
+#define WIFI_TX_POWER_FIX() WiFi.setTxPower(WIFI_POWER_8_5dBm)
 constexpr unsigned long STATUS_PUBLISH_INTERVAL = 1000;
-constexpr unsigned long GLASS_CHECK_INTERVAL = 100;
+constexpr unsigned long SENSOR_READ_INTERVAL = 100;
+// raw distance for the web UI (watch a glass fill, calibrate thresholds)
+constexpr unsigned long SENSOR_PUBLISH_INTERVAL = 250;
 
 // TODO calibrate: run the pump, measure the poured volume, adjust.
 constexpr float MS_PER_ML = 120.0;
 // Hard valve-open cap, independent of everything else (stuck-valve net).
 constexpr unsigned long MAX_POUR_MS = 10000;
-// Sensor-to-glass-rim distance below this means a glass is present.
-constexpr long GLASS_PRESENT_MM = 60;
+// TODO calibrate: sensor-to-glass distance below this means a glass is
+// present (20 cm is the threshold the old sketch switched the pump at).
+constexpr long GLASS_PRESENT_MM = 200;
+// Ultrasonic sensors miss an echo now and then; only abort a running pour
+// after this many no-glass readings in a row (~300 ms at 100 ms checks).
+constexpr int NO_GLASS_ABORT_READS = 3;
 // Reservoir estimate: one bottle; refill and reboot to reset the counter.
 constexpr unsigned long TANK_CAPACITY_ML = 700;
 
@@ -34,6 +46,7 @@ constexpr const char* mqttHost = "192.168.16.127"; // same broker as the train
 constexpr const char* mqttSubTopic = "shotexpress/fuel/command";
 constexpr const char* mqttEventTopic = "shotexpress/fuel/event";
 constexpr const char* mqttStatusTopic = "shotexpress/fuel/status";
+constexpr const char* mqttSensorTopic = "shotexpress/fuel/sensor"; // plain mm, -1 = no echo
 
 WiFiClient net;
 MQTTClient mqttClient(1024);
@@ -43,7 +56,9 @@ WiFiClient telnetClient;
 
 unsigned long lastWifiRetry = 0;
 unsigned long lastStatusTime = 0;
-unsigned long lastGlassCheck = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastSensorPublish = 0;
+long distanceMm = -1; // latest ultrasonic reading, refreshed every SENSOR_READ_INTERVAL
 
 // ---- envelope bookkeeping ----------------------------------------------
 
@@ -63,35 +78,47 @@ String activeCmdId = "";
 unsigned long pourStartedAt = 0;
 unsigned long pourDurationMs = 0;
 unsigned long dispensedMl = 0;
+int noGlassReads = 0;
 
-// ---- dummy hardware (replace with the real libraries) --------------------
+// ---- hardware --------------------------------------------------------------
 // The rest of the sketch only talks to these functions.
 
 void pumpSetup() {
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW); // TODO relay module may be active-low
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
 }
 
 void pumpOn() {
-  digitalWrite(RELAY_PIN, HIGH); // TODO real relay drive
+  digitalWrite(PUMP_PIN, HIGH);
 }
 
 void pumpOff() {
-  digitalWrite(RELAY_PIN, LOW); // TODO real relay drive
+  digitalWrite(PUMP_PIN, LOW);
 }
 
 void glassSensorSetup() {
-  pinMode(TRIG_PIN, OUTPUT); // TODO real ultrasonic lib setup
+  pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
 }
 
+// HC-SR04 distance in mm, -1 when no echo came back (blocks up to 30 ms).
 long readDistanceMm() {
-  // TODO real HC-SR04 read (10 us trigger pulse, pulseIn on echo).
-  return 42; // dummy: pretend a glass always sits under the spout
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long durationUs = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (durationUs == 0) return -1;
+  return (long)(durationUs * 0.343 / 2.0); // speed of sound: 0.343 mm/us
 }
 
+// Uses the latest reading (at most SENSOR_READ_INTERVAL old).
+// No echo counts as "no glass" — never pour on a failed measurement.
 bool glassPresent() {
-  return readDistanceMm() <= GLASS_PRESENT_MM;
+  return distanceMm >= 0 && distanceMm <= GLASS_PRESENT_MM;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +289,7 @@ void messageReceived(String &topic, String &payload) {
   activeCmdId = cmdId;
   pourStartedAt = millis();
   pourDurationMs = pourMs;
+  noGlassReads = 0;
   dispensedMl += volumeMl;
   pumpOn();
   debugPrintln("Status: pouring " + String(volumeMl) + " ml (" + String(pourMs) + " ms)");
@@ -284,13 +312,29 @@ void handleTelnet() {
   }
 }
 
+const char* wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SSID_AVAIL: return "NO_SSID_AVAIL (network not found)";
+    case WL_CONNECT_FAILED: return "CONNECT_FAILED (wrong password?)";
+    case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+    case WL_DISCONNECTED: return "DISCONNECTED";
+    case WL_IDLE_STATUS: return "IDLE";
+    default: return "OTHER";
+  }
+}
+
 void handleConnection() {
   unsigned long currentMillis = millis();
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (currentMillis - lastWifiRetry > WIFI_RETRY_INTERVAL) {
-      Serial.print("Connecting to WiFi...");
+    // the ESP keeps trying on its own (setAutoReconnect); only restart the
+    // attempt after a long quiet spell, never while it is still connecting
+    if (currentMillis - lastWifiRetry > WIFI_RESTART_INTERVAL) {
+      Serial.println("WiFi not connected, status " + String(wifiStatusName(WiFi.status())) +
+                     " — restarting connect to " + String(ssid));
+      WiFi.disconnect();
       WiFi.begin(ssid, pass);
+      WIFI_TX_POWER_FIX();
       lastWifiRetry = currentMillis;
     }
     return;
@@ -323,7 +367,20 @@ void setup() {
   glassSensorSetup();
 
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+      Serial.println("WiFi connected, IP " + WiFi.localIP().toString() +
+                     ", signal " + String(WiFi.RSSI()) + " dBm");
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      // reason 201 = network not found, 15/202/204 = wrong password, 2 = auth timeout (signal/TX power)
+      Serial.println("WiFi disconnected, reason " + String(info.wifi_sta_disconnected.reason));
+    }
+  });
+  Serial.println("Connecting to WiFi " + String(ssid) + "...");
   WiFi.begin(ssid, pass);
+  WIFI_TX_POWER_FIX();
+  lastWifiRetry = millis();
   configTime(0, 0, "pool.ntp.org"); // ts_ms / ttl need the real clock
 
   telnetServer.begin();
@@ -343,6 +400,17 @@ void loop() {
       publishStatus();
       lastStatusTime = millis();
     }
+    if (millis() - lastSensorPublish >= SENSOR_PUBLISH_INTERVAL) {
+      mqttClient.publish(mqttSensorTopic, String(distanceMm));
+      lastSensorPublish = millis();
+    }
+  }
+
+  bool freshReading = false;
+  if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
+    lastSensorRead = millis();
+    distanceMm = readDistanceMm();
+    freshReading = true;
   }
 
   // A running pour continues offline; only the reports wait for reconnect.
@@ -353,9 +421,9 @@ void loop() {
     } else if (millis() - pourStartedAt >= pourDurationMs) {
       finishPour("completed");
       debugPrintln("Status: pour completed");
-    } else if (millis() - lastGlassCheck >= GLASS_CHECK_INTERVAL) {
-      lastGlassCheck = millis();
-      if (!glassPresent()) {
+    } else if (freshReading) {
+      noGlassReads = glassPresent() ? 0 : noGlassReads + 1;
+      if (noGlassReads >= NO_GLASS_ABORT_READS) {
         finishPour("failed", "NO_GLASS", "glass removed mid-pour");
         debugPrintln("Error: glass removed mid-pour");
       }

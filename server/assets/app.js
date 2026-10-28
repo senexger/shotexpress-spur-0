@@ -3,6 +3,22 @@
 const SNAPSHOT_URL = "/api/train/state";
 const COMMAND_URL = "/api/train/command";
 const MANUAL_URL = "/api/train/manual";
+const SPEED_URL = "/api/train/speed";
+const MOVE_URL = "/api/train/move";
+const MAX_SPEED_HZ = 20000;
+const MAX_MOVE_STEPS = 1000000;
+const ACCEL_URL = "/api/train/accel";
+const MAX_ACCEL = 1000000;
+const FUEL_DISPENSE_URL = "/api/fuel/dispense";
+const FUEL_STOP_URL = "/api/fuel/stop";
+const MAX_FILL_ML = 500;
+// the station heartbeats every second; quiet this long = offline
+const FUEL_OFFLINE_AFTER_MS = 5000;
+// must match GLASS_PRESENT_MM in fuel-station.ino (display only)
+const GLASS_PRESENT_MM = 200;
+const FUEL_CHART_WINDOW_MS = 30000;
+// forward speed presets in steps/s; the server caps at 20000 (Train.ino MAX_SPEED_HZ)
+const SPEED_PRESETS_HZ = [2000, 4000, 6000, 8000, 10000, 12000, 14000, 16000, 18000, 20000];
 const TRACK_URL = "/api/track";
 const STREAM_URL = "/api/train/stream";
 
@@ -15,6 +31,16 @@ const state = {
   lastTagRead: null,
   lastRawStatus: null,
   trainOnline: false,
+  speedHz: null,
+  accel: null,
+  fuelStatus: null,
+  // browser receive time of the last fuel heartbeat (station clock may be unsynced)
+  fuelStatusSeenAt: null,
+  fuelLastEvent: null,
+  fuelError: null,
+  fuelDistanceMm: null,
+  // [browser time, mm] for the chart; -1 (no echo) kept as a gap
+  fuelDistanceHistory: [],
   stations: [],
   manualError: null,
 };
@@ -25,6 +51,26 @@ const el = {
   stationButtons: document.getElementById("station-buttons"),
   manualError: document.getElementById("manual-error"),
   manualButtons: document.querySelectorAll("[data-action]"),
+  speedButtons: document.getElementById("speed-buttons"),
+  speedCurrent: document.getElementById("speed-current"),
+  accelCurrent: document.getElementById("accel-current"),
+  typedAccel: document.getElementById("typed-accel"),
+  typedHz: document.getElementById("typed-hz"),
+  typedSteps: document.getElementById("typed-steps"),
+  typedMl: document.getElementById("typed-ml"),
+  fuelState: document.getElementById("fuel-state"),
+  fuelLastEvent: document.getElementById("fuel-last-event"),
+  fuelError: document.getElementById("fuel-error"),
+  fuelDistance: document.getElementById("fuel-distance"),
+  fuelGlass: document.getElementById("fuel-glass"),
+  fuelChartLine: document.getElementById("fuel-chart-line"),
+  fuelChartRange: document.getElementById("fuel-chart-range"),
+  fuelButtons: [document.getElementById("fuel-fill"), document.getElementById("fuel-stop")],
+  fireButtons: [
+    document.getElementById("fire-speed"),
+    document.getElementById("fire-steps"),
+    document.getElementById("fire-accel"),
+  ],
   statusEmpty: document.getElementById("status-empty"),
   statusGrid: document.getElementById("status-grid"),
   statusState: document.getElementById("status-state"),
@@ -77,6 +123,35 @@ function reduce(event) {
       state.lastTagRead = event.payload.lastTagRead;
       state.lastRawStatus = event.payload.lastRawStatus;
       state.trainOnline = event.payload.trainOnline;
+      state.speedHz = event.payload.speedHz;
+      state.accel = event.payload.accel;
+      state.fuelStatus = event.payload.fuelStatus;
+      state.fuelLastEvent = event.payload.fuelLastEvent;
+      state.fuelDistanceMm = event.payload.fuelDistanceMm;
+      break;
+    case "fueldistance": {
+      const now = Date.now();
+      state.fuelDistanceMm = event.payload;
+      state.fuelDistanceHistory.push([now, event.payload]);
+      while (state.fuelDistanceHistory.length && state.fuelDistanceHistory[0][0] < now - FUEL_CHART_WINDOW_MS) {
+        state.fuelDistanceHistory.shift();
+      }
+      // 4 Hz: only redraw the fuel card, not the whole page
+      renderFuel();
+      return;
+    }
+    case "fuelstatus":
+      state.fuelStatus = event.payload;
+      state.fuelStatusSeenAt = Date.now();
+      break;
+    case "fuelevent":
+      state.fuelLastEvent = event.payload;
+      break;
+    case "speed":
+      state.speedHz = event.payload;
+      break;
+    case "accel":
+      state.accel = event.payload;
       break;
     case "connection":
       state.connection = event.payload;
@@ -144,6 +219,18 @@ function render() {
   for (const button of el.manualButtons) {
     button.disabled = state.connection !== "connected";
   }
+
+  setText(el.speedCurrent, state.speedHz ? `${state.speedHz} steps/s` : "—");
+  setText(el.accelCurrent, state.accel ? `${state.accel} steps/s²` : "—");
+  for (const button of el.fireButtons) {
+    button.disabled = state.connection !== "connected";
+  }
+  for (const button of el.speedButtons.querySelectorAll("button")) {
+    button.disabled = state.connection !== "connected";
+    button.classList.toggle("buttonActive", Number(button.dataset.hz) === state.speedHz);
+  }
+
+  renderFuel();
 
   const tagRead = state.lastTagRead;
   setText(
@@ -254,7 +341,195 @@ async function sendManual(action) {
   render();
 }
 
+async function postRaw(url, body) {
+  state.manualError = null;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => null);
+      const details = data?.details ? `: ${data.details}` : "";
+      throw new Error(`${data?.error ?? `Command failed (${response.status})`}${details}`);
+    }
+    // raw commands are manual overrides: the busy slot is dropped
+    state.isBusy = false;
+  } catch (err) {
+    state.manualError = err instanceof Error ? err.message : "Failed to send command";
+  }
+  render();
+}
+
+function renderFuel() {
+  const online =
+    state.fuelStatusSeenAt !== null && Date.now() - state.fuelStatusSeenAt < FUEL_OFFLINE_AFTER_MS;
+  const fuel = state.fuelStatus;
+  let label = "no heartbeat yet";
+  if (fuel && online) label = `${fuel.state} · tank ~${fuel.tank_pct}%`;
+  else if (fuel) label = "offline";
+  setText(el.fuelState, label);
+  el.fuelState.classList.toggle("statusDead", Boolean(fuel) && !online);
+
+  const event = state.fuelLastEvent;
+  let reply = "—";
+  if (event) {
+    reply = event.exec_type;
+    if (event.error) reply += ` (${event.error.code}: ${event.error.reason})`;
+  }
+  setText(el.fuelLastEvent, reply);
+
+  const mm = state.fuelDistanceMm;
+  if (mm === null || mm === undefined) {
+    setText(el.fuelDistance, "—");
+    setText(el.fuelGlass, "");
+  } else if (mm < 0) {
+    setText(el.fuelDistance, "no echo");
+    setText(el.fuelGlass, "· counts as no glass");
+  } else {
+    setText(el.fuelDistance, `${mm} mm`);
+    setText(el.fuelGlass, mm <= GLASS_PRESENT_MM ? "· glass detected" : "· no glass");
+  }
+  renderFuelChart();
+
+  el.fuelError.hidden = !state.fuelError;
+  if (state.fuelError) setText(el.fuelError, state.fuelError);
+  for (const button of el.fuelButtons) {
+    button.disabled = state.connection !== "connected";
+  }
+}
+
+function renderFuelChart() {
+  const points = state.fuelDistanceHistory.filter(([, mm]) => mm >= 0);
+  if (points.length === 0) {
+    el.fuelChartLine.setAttribute("points", "");
+    setText(el.fuelChartRange, "no data");
+    return;
+  }
+  const values = points.map(([, mm]) => mm);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = Math.max(max - min, 10); // keep a flat line from filling the box
+  const end = Date.now();
+  const coords = points.map(([t, mm]) => {
+    const x = 300 - ((end - t) / FUEL_CHART_WINDOW_MS) * 300;
+    const y = 55 - ((mm - min) / span) * 50;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  el.fuelChartLine.setAttribute("points", coords.join(" "));
+  setText(el.fuelChartRange, `${min}–${max} mm`);
+}
+
+async function postFuel(url, body) {
+  state.fuelError = null;
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => null);
+      const details = data?.details ? `: ${data.details}` : "";
+      throw new Error(`${data?.error ?? `Fuel command failed (${response.status})`}${details}`);
+    }
+  } catch (err) {
+    state.fuelError = err instanceof Error ? err.message : "Failed to send fuel command";
+  }
+  render();
+}
+
+function fireFill() {
+  const volume = Number(el.typedMl.value);
+  if (!Number.isInteger(volume) || volume < 1 || volume > MAX_FILL_ML) {
+    state.fuelError = `Amount must be a whole number between 1 and ${MAX_FILL_ML} ml`;
+    render();
+    return;
+  }
+  postFuel(FUEL_DISPENSE_URL, { volume_ml: volume });
+}
+
+function sendSpeed(hz) {
+  return postRaw(SPEED_URL, { hz });
+}
+
+// typed values: whole numbers in range, else an inline error
+function readTyped(input, name, min, max) {
+  const value = Number(input.value);
+  if (!Number.isInteger(value) || value < min || value > max || value === 0) {
+    state.manualError = `${name} must be a non-zero whole number between ${min} and ${max}`;
+    render();
+    return null;
+  }
+  return value;
+}
+
+function readTypedAccel() {
+  return readTyped(el.typedAccel, "Acceleration", 1, MAX_ACCEL);
+}
+
+function fireTypedSpeed() {
+  const hz = readTyped(el.typedHz, "Speed", 1, MAX_SPEED_HZ);
+  if (hz === null) return;
+  const accel = readTypedAccel();
+  if (accel !== null) postRaw(SPEED_URL, { hz, accel });
+}
+
+function fireTypedSteps() {
+  const hz = readTyped(el.typedHz, "Speed", 1, MAX_SPEED_HZ);
+  if (hz === null) return;
+  const accel = readTypedAccel();
+  if (accel === null) return;
+  const steps = readTyped(el.typedSteps, "Steps", -MAX_MOVE_STEPS, MAX_MOVE_STEPS);
+  if (steps !== null) postRaw(MOVE_URL, { steps, hz, accel });
+}
+
+function fireTypedAccel() {
+  const accel = readTypedAccel();
+  if (accel !== null) postRaw(ACCEL_URL, { accel });
+}
+
+// remember typed values per browser; storage may be unavailable
+function restoreTyped(input, key) {
+  try {
+    const saved = localStorage.getItem(key);
+    if (saved !== null) input.value = saved;
+  } catch {}
+  input.addEventListener("change", () => {
+    try {
+      localStorage.setItem(key, input.value);
+    } catch {}
+  });
+}
+
+function renderSpeedButtons() {
+  el.speedButtons.replaceChildren(
+    ...SPEED_PRESETS_HZ.map((hz, i) => {
+      const button = document.createElement("button");
+      button.className = "button";
+      button.textContent = `${i + 1}`;
+      button.title = `Forward at ${hz} steps/s`;
+      button.dataset.hz = String(hz);
+      button.addEventListener("click", () => sendSpeed(hz));
+      return button;
+    }),
+  );
+}
+
 async function init() {
+  renderSpeedButtons();
+  restoreTyped(el.typedHz, "shotexpress.typedHz");
+  restoreTyped(el.typedSteps, "shotexpress.typedSteps");
+  restoreTyped(el.typedMl, "shotexpress.typedMl");
+  el.fuelButtons[0].addEventListener("click", fireFill);
+  el.fuelButtons[1].addEventListener("click", () => postFuel(FUEL_STOP_URL));
+  // flips the fuel station to "offline" when its heartbeat stops
+  setInterval(renderFuel, 1000);
+  el.fireButtons[0].addEventListener("click", fireTypedSpeed);
+  el.fireButtons[1].addEventListener("click", fireTypedSteps);
+  el.fireButtons[2].addEventListener("click", fireTypedAccel);
+  restoreTyped(el.typedAccel, "shotexpress.typedAccel");
   for (const button of el.manualButtons) {
     button.addEventListener("click", () => sendManual(button.dataset.action));
   }
