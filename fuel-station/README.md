@@ -81,7 +81,7 @@ Das Feld `exec_type` sagt, was passiert ist:
 
 1. `{"…umschlag…", "exec_type": "accepted"}` — sofort nach Empfang, „habe verstanden, gieße jetzt".
 2. `{"…umschlag…", "exec_type": "completed"}` — Sollmenge erreicht, Ventil zu.
-3. `{"…umschlag…", "exec_type": "failed", "error": {"code": "TANK_EMPTY", "reason": "reservoir below cutoff"}}` — ging nicht. Bekannte Codes: `TANK_EMPTY`, `POUR_TIMEOUT` (harte Obergrenze der Gießzeit gerissen — Sicherheitsnetz gegen klemmendes Ventil), `NO_GLASS` (kein Glas unter dem Auslauf, laut Ultraschallsensor).
+3. `{"…umschlag…", "exec_type": "failed", "error": {"code": "TANK_EMPTY", "reason": "reservoir below cutoff"}}` — ging nicht. Bekannte Codes: `TANK_EMPTY`, `POUR_TIMEOUT` (harte Obergrenze der Gießzeit gerissen — Sicherheitsnetz gegen klemmendes Ventil), `NO_GLASS` (derzeit nicht verwendet, Glas-Prüfung entfernt).
 4. `{"…umschlag…", "exec_type": "cancelled"}` — ein `stop` hat einen laufenden Guss abgebrochen.
 5. `{"…umschlag…", "exec_type": "expired"}` — Kommando war beim Empfang schon verfallen.
 
@@ -121,20 +121,21 @@ Die Referenz-Implementierung liegt hier im Ordner: **`fuel-station.ino`**
 
 Die Hardware ist im Abschnitt **„hardware"** schon verdrahtet (übernommen
 aus `fuel-station-old/UltraschallPimpe.ino`): Pumpe über IRLZ34N-MOSFET
-(Low-side) an GPIO19, HC-SR04 mit TRIG=4 und ECHO=5. Liefert der Sensor kein
-Echo, gilt das als „kein Glas" — gegossen wird nur mit gültiger Messung.
-Während des Gießens bricht erst der 3. Fehl-Read in Folge den Guss ab
-(`NO_GLASS_ABORT_READS`), weil Ultraschall gelegentlich ein Echo verliert.
+(Low-side) an GPIO19, HC-SR04 mit TRIG=4 und ECHO=5.
+Der Sensor dient nur noch der Diagnose (Abstand auf `shotexpress/fuel/sensor`);
+die Glas-Prüfung ist entfernt, gegossen wird auch ohne erkanntes Glas.
 
-Noch zu kalibrieren: `MS_PER_ML` (gießen und messen), `GLASS_PRESENT_MM`
-(Abstand Sensor → Glas, aktuell 200 mm wie im alten Sketch) und
-`TANK_CAPACITY_ML`.
+Noch zu kalibrieren: `MS_PER_ML` (gießen und messen) und `TANK_CAPACITY_ML`.
 
 **Achtung:** Der ECHO-Pin des HC-SR04 liefert 5 V, der ESP32 verträgt nur
 3,3 V — ein Spannungsteiler am ECHO-Pin wird empfohlen.
 
 Daneben gehört eine `credentials.h` mit `SECRET_SSID`/`SECRET_PASS`
 (einfach die aus `Train/` kopieren, ist absichtlich nicht im Git).
+
+Den Broker findet die Station wie der Zug per mDNS: zuerst den Dienst
+`_mqtt._tcp`, dann `shotexpress.local`, sonst die feste IP `mqttHost` im
+Sketch. Die Station selbst heißt im Netz `shotexpress-fuel.local`.
 
 ## Testen ohne Server
 
@@ -156,3 +157,18 @@ Erwartet: sofort `accepted`, nach ~`volume_ml × ms_pro_ml` ein `completed`.
 
 Die verbindlichen Nachrichtenformate (mit Tests) liegen in
 `protocol/src/lib.rs`, Abschnitt „fuel station".
+
+## Messprotokoll (Server)
+
+Der Server schreibt jede Ultraschall-Messung, jedes Gieß-Kommando, alle
+Antworten/Heartbeats der Tankstelle und jeden Tag-Read des Zugs in eine
+JSON-Lines-Datei: `logs/fuel-<ts_ms>.jsonl` (neue Datei pro Serverstart,
+Ordner per `FUEL_LOG_DIR` änderbar). Jede Zeile hat `ts_ms` (Serveruhr) und
+`kind`; Messungen tragen die Nummer des letzten Gusses (`pour`), ob gerade
+gegossen wird (`pouring`) und die ms seit dem Gieß-Kommando (`t_pour_ms`).
+Format im Detail: Kopfkommentar in `server/src/fuel_log.rs`.
+
+```sh
+# alle Messungen von Guss 3:
+jq -c 'select(.kind=="sensor" and .pour==3)' logs/fuel-*.jsonl
+```

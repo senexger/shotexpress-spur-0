@@ -1,13 +1,15 @@
-//! The track map (`track.toml`): the server-side knowledge the train
-//! deliberately doesn't have. Loading validates the config against the
-//! physics (RFID watchdog, braking distance) so impossible setups fail at
-//! startup instead of on the rails, and `compile_route` turns "go to
-//! station X" into the leg schedule the train executes.
+//! The track map (`track.toml`): a flat list of tags, like ETCS balises.
+//! Every tag is read from one side only, so its uid alone says where the
+//! train is and which way it is heading. A tag either sets the speed from
+//! there on, or is a station (full stop when it is the ride's target).
+//! The server publishes this as the train's tag table; a ride only names
+//! the target station.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use shotexpress_protocol::Leg;
+use shotexpress_protocol::{TagKind, TagRule, TrackTable};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrackConfig {
@@ -15,17 +17,31 @@ pub struct TrackConfig {
     pub refill: RefillParams,
     #[serde(rename = "station")]
     pub stations: Vec<Station>,
-    #[serde(rename = "node")]
-    pub nodes: Vec<Node>,
+    #[serde(rename = "speed", default)]
+    pub speeds: Vec<SpeedTag>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TrainParams {
     pub max_speed: f64,
-    pub default_speed: f64,
+    pub start_speed: f64,
     pub accel: f64,
+    /// RFID watchdog: the train stops itself after this long without a
+    /// tag. 0 = off.
     pub max_run_ms_without_tag: u64,
     pub default_ttl_ms: u64,
+}
+
+impl TrainParams {
+    /// The value a ride carries. The firmware compares against a 32-bit
+    /// millis() difference, so u32::MAX never fires (and a bigger number
+    /// would make ArduinoJson fall back to its 30 s default).
+    pub fn watchdog_ms(&self) -> u64 {
+        match self.max_run_ms_without_tag {
+            0 => u32::MAX as u64,
+            ms => ms.min(u32::MAX as u64),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -33,25 +49,74 @@ pub struct RefillParams {
     pub station: String,
     pub steps: u32,
     pub speed: f64,
+    /// One shot, in ml (what the fuel station pours per glass).
+    #[serde(default = "default_shot_ml")]
+    pub shot_ml: u32,
+    /// Most shots one order may ask for (glasses on the wagon).
+    #[serde(default = "default_max_shots")]
+    pub max_shots: u32,
+    /// The firmware reports no `completed` for `steps` yet, so an order
+    /// waits this long for a nudge to finish before the next pour.
+    #[serde(default = "default_nudge_wait_ms")]
+    pub nudge_wait_ms: u64,
+    /// false: shots are filled by hand, an order only drives to its station.
+    #[serde(default = "default_auto_fill")]
+    pub auto_fill: bool,
+}
+
+fn default_auto_fill() -> bool {
+    true
+}
+
+fn default_shot_ml() -> u32 {
+    20
+}
+
+fn default_max_shots() -> u32 {
+    6
+}
+
+fn default_nudge_wait_ms() -> u64 {
+    3000
+}
+
+/// What happens at a station: shots are taken off (`unload`) or the
+/// fuel station fills new ones (`refill`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StationRole {
+    Unload,
+    Refill,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Station {
     pub name: String,
     pub tag: String,
-    pub approach_speed: f64,
+    pub role: StationRole,
+    /// After arriving, wait `wait_s` seconds, then drive on to `then`.
     #[serde(default)]
-    pub pass_through_speed: Option<f64>,
+    pub then: Option<String>,
+    #[serde(default)]
+    pub wait_s: u64,
 }
 
-/// A ring node: `tag` is read when crossing into it; the edge fields
-/// describe the track *leaving* it (toward the next node).
+/// "From this tag on, at most `speed`."
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Node {
+pub struct SpeedTag {
     pub tag: String,
-    pub edge_ms: u64,
-    pub edge_len_m: f64,
-    pub speed_limit: f64,
+    pub speed: f64,
+    /// Free text for humans ("curve B", "switch west").
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+fn check_speed(what: &str, speed: f64) -> Result<(), String> {
+    if speed > 0.0 && speed <= 1.0 {
+        Ok(())
+    } else {
+        Err(format!("{what}: speed {speed} must be in (0, 1]"))
+    }
 }
 
 impl TrackConfig {
@@ -65,184 +130,98 @@ impl TrackConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
-        let n = self.nodes.len();
-        if n < 2 {
-            return Err("track needs at least 2 nodes".into());
+        check_speed("train.max_speed", self.train.max_speed)?;
+        check_speed("train.start_speed", self.train.start_speed)?;
+        if self.train.accel <= 0.0 {
+            return Err("train.accel must be positive".into());
         }
 
-        for (i, node) in self.nodes.iter().enumerate() {
-            if !(0.0..=1.0).contains(&node.speed_limit) || node.speed_limit <= 0.0 {
-                return Err(format!(
-                    "node {i} ({}): speed_limit must be in (0, 1]",
-                    node.tag
-                ));
-            }
-            if node.edge_ms == 0 {
-                return Err(format!("node {i} ({}): edge_ms must be positive", node.tag));
-            }
-        }
+        // one meaning per tag: a uid is either a station or a speed tag
+        let mut uids = HashSet::new();
+        let mut names = HashSet::new();
         for s in &self.stations {
-            if !(0.0..=1.0).contains(&s.approach_speed) || s.approach_speed <= 0.0 {
-                return Err(format!(
-                    "station {}: approach_speed must be in (0, 1]",
-                    s.name
-                ));
+            if !names.insert(s.name.as_str()) {
+                return Err(format!("station {} is defined twice", s.name));
             }
-            if !self.nodes.iter().any(|node| node.tag == s.tag) {
-                return Err(format!(
-                    "station {}: tag {} is not on the ring",
-                    s.name, s.tag
-                ));
+            // an empty tag is a placeholder: not stuck on the track yet
+            if !s.tag.is_empty() && !uids.insert(s.tag.as_str()) {
+                return Err(format!("tag {} is used twice", s.tag));
             }
         }
-        if self.station(&self.refill.station).is_none() {
-            return Err(format!(
+        for t in &self.speeds {
+            check_speed(&format!("speed tag {}", t.tag), t.speed)?;
+            if !t.tag.is_empty() && !uids.insert(t.tag.as_str()) {
+                return Err(format!("tag {} is used twice", t.tag));
+            }
+        }
+
+        for s in &self.stations {
+            if let Some(next) = &s.then {
+                if self.station(next).is_none() {
+                    return Err(format!("station {}: then = {next} is not a station", s.name));
+                }
+                if next == &s.name {
+                    return Err(format!("station {}: then must name another station", s.name));
+                }
+            }
+        }
+
+        match self.station(&self.refill.station) {
+            None => Err(format!(
                 "refill.station {} is not a station",
                 self.refill.station
-            ));
-        }
-
-        // Localization needs unique consecutive reading pairs: the server
-        // pins the train's ring node from two successive progress tags.
-        for j in 0..n {
-            let pair = (&self.nodes[(j + n - 1) % n].tag, &self.nodes[j].tag);
-            for k in (j + 1)..n {
-                let other = (&self.nodes[(k + n - 1) % n].tag, &self.nodes[k].tag);
-                if pair == other {
-                    return Err(format!(
-                        "reading pair ({} -> {}) appears at nodes {j} and {k}: \
-                         position would be ambiguous",
-                        pair.0, pair.1
-                    ));
-                }
+            )),
+            Some(s) if s.role != StationRole::Refill => Err(format!(
+                "refill.station {} has role {:?}, expected refill",
+                s.name, s.role
+            )),
+            Some(_) if self.refill.shot_ml == 0 || self.refill.max_shots == 0 => {
+                Err("refill.shot_ml and refill.max_shots must be positive".into())
             }
+            Some(_) => Ok(()),
         }
-
-        // RFID watchdog: the slowest speed any compiled leg can use on an
-        // edge must still reach the next tag within max_run_ms_without_tag.
-        for i in 0..n {
-            let entered = &self.nodes[(i + 1) % n].tag;
-            let slowest = self.slowest_leg_speed(i, entered);
-            let worst_ms = self.nodes[i].edge_ms as f64 / slowest;
-            if worst_ms >= self.train.max_run_ms_without_tag as f64 {
-                return Err(format!(
-                    "edge {} -> {} takes {worst_ms:.0} ms at its slowest compiled \
-                     speed {slowest}, tripping the {} ms RFID watchdog; raise the \
-                     speed or the watchdog",
-                    self.nodes[i].tag, entered, self.train.max_run_ms_without_tag
-                ));
-            }
-        }
-
-        // Braking: slowing from max_speed to a station's approach_speed must
-        // fit within the edge leading into it, even at the shortest possible
-        // traversal (full speed). Otherwise the crawl tag sits too close.
-        for s in &self.stations {
-            let ramp_ms = (self.train.max_speed - s.approach_speed) / self.train.accel * 1000.0;
-            for j in 0..n {
-                if self.nodes[j].tag == s.tag {
-                    let edge_in_ms = self.nodes[(j + n - 1) % n].edge_ms as f64;
-                    if ramp_ms > edge_in_ms {
-                        return Err(format!(
-                            "station {}: braking to approach_speed {} needs {ramp_ms:.0} ms \
-                             but the edge into node {j} only takes {edge_in_ms:.0} ms; \
-                             raise accel or approach_speed",
-                            s.name, s.approach_speed
-                        ));
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub fn station(&self, name: &str) -> Option<&Station> {
         self.stations.iter().find(|s| s.name == name)
     }
 
-    fn station_by_tag(&self, tag: &str) -> Option<&Station> {
-        self.stations.iter().find(|s| s.tag == tag)
-    }
-
-    /// The unique ring node crossed when `cur` was read right after `prev`
-    /// (pair uniqueness is enforced by validation).
-    pub fn node_for_pair(&self, prev: &str, cur: &str) -> Option<usize> {
-        let n = self.nodes.len();
-        (0..n).find(|&j| self.nodes[(j + n - 1) % n].tag == prev && self.nodes[j].tag == cur)
-    }
-
-    /// The lowest speed `compile_route` could ever assign to the leg over
-    /// edge `i` into a node reading `entered_tag`.
-    fn slowest_leg_speed(&self, i: usize, entered_tag: &str) -> f64 {
-        let mut speed = self.nodes[i].speed_limit;
-        if let Some(s) = self.station_by_tag(entered_tag) {
-            speed = speed.min(s.approach_speed);
-            if let Some(pass) = s.pass_through_speed {
-                speed = speed.min(pass);
-            }
-        }
-        speed
-    }
-
-    /// Compile "go to `station`" into a leg schedule. `from_node` is the
-    /// train's last known ring node; without one the schedule covers the
-    /// whole ring — wherever the train really is, its first read resyncs it
-    /// (forward-only ring), at worst costing one lap.
-    pub fn compile_route(
-        &self,
-        from_node: Option<usize>,
-        station_name: &str,
-        speed: Option<f64>,
-    ) -> Result<Vec<Leg>, String> {
-        let station = self
-            .station(station_name)
-            .ok_or_else(|| format!("unknown station {station_name}"))?;
-        let n = self.nodes.len();
-        let cruise = speed
-            .unwrap_or(self.train.default_speed)
-            .min(self.train.max_speed);
-
-        let (start, len) = match from_node {
-            // nearest occurrence of the stop tag wins
-            Some(from) => {
-                let steps = (1..=n)
-                    .find(|&d| self.nodes[(from + d) % n].tag == station.tag)
-                    .expect("station tag exists on the ring (validated)");
-                (from, steps)
-            }
-            // unknown position: full ring, ending on the stop tag
-            None => {
-                let stop = self
-                    .nodes
+    /// The tag table the train caches (published retained). Tags not
+    /// assigned yet (empty uid) are left out.
+    pub fn table(&self) -> TrackTable {
+        let tags: Vec<TagRule> = self
+            .stations
+            .iter()
+            .filter(|s| !s.tag.is_empty())
+            .map(|s| TagRule {
+                uid: s.tag.clone(),
+                kind: TagKind::Station {
+                    station: s.name.clone(),
+                },
+            })
+            .chain(
+                self.speeds
                     .iter()
-                    .position(|node| node.tag == station.tag)
-                    .expect("station tag exists on the ring (validated)");
-                (stop, n)
-            }
-        };
-
-        let mut legs = Vec::with_capacity(len);
-        for d in 1..=len {
-            let node = (start + d) % n;
-            let edge = (node + n - 1) % n;
-            let tag = &self.nodes[node].tag;
-            let mut leg_speed = cruise.min(self.nodes[edge].speed_limit);
-            if d == len {
-                leg_speed = leg_speed.min(station.approach_speed);
-            } else if let Some(s) = self.station_by_tag(tag)
-                && let Some(pass) = s.pass_through_speed
-            {
-                // realism: roll gently through stations we don't stop at
-                leg_speed = leg_speed.min(pass);
-            }
-            legs.push(Leg {
-                tag: tag.clone(),
-                speed: leg_speed,
-            });
+                    .filter(|t| !t.tag.is_empty())
+                    .map(|t| TagRule {
+                        uid: t.tag.clone(),
+                        kind: TagKind::Speed { speed: t.speed },
+                    }),
+            )
+            .collect();
+        let json = serde_json::to_vec(&tags).expect("tag table serializes");
+        TrackTable {
+            version: fnv1a(&json),
+            tags,
         }
-        Ok(legs)
     }
+}
+
+/// Stable 32-bit hash (FNV-1a): same tags, same version, across restarts.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5u32, |hash, b| {
+        (hash ^ *b as u32).wrapping_mul(0x0100_0193)
+    })
 }
 
 #[cfg(test)]
@@ -250,99 +229,123 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn repo_track() -> TrackConfig {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../track.toml");
-        TrackConfig::load(&path).expect("repo track.toml must be valid")
+    const FIXTURE: &str = r#"
+[train]
+max_speed = 1.0
+start_speed = 0.3
+accel = 0.5
+max_run_ms_without_tag = 30000
+default_ttl_ms = 60000
+
+[refill]
+station = "bar"
+steps = 1000
+speed = 0.2
+
+[[station]]
+name = "bar"
+tag = "AA000001"
+role = "refill"
+
+[[station]]
+name = "raucherecke"
+tag = "AA000002"
+role = "unload"
+
+[[speed]]
+tag = "BB000001"
+speed = 0.4
+"#;
+
+    fn fixture() -> TrackConfig {
+        let track: TrackConfig = toml::from_str(FIXTURE).unwrap();
+        track.validate().unwrap();
+        track
     }
 
     #[test]
     fn repo_track_toml_loads_and_validates() {
-        let track = repo_track();
-        assert_eq!(track.nodes.len(), 14);
-        assert_eq!(track.stations.len(), 3);
-        assert_eq!(track.refill.station, "bar");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../track.toml");
+        let track = TrackConfig::load(&path).expect("repo track.toml must be valid");
+        assert!(track.station(&track.refill.station).is_some());
     }
 
     #[test]
-    fn node_for_pair_disambiguates_passes() {
-        let track = repo_track();
-        // eastbound: station1 then track12 -> node 1
-        assert_eq!(track.node_for_pair("station1", "track12"), Some(1));
-        // westbound pass of the same tags: station2 then track12 -> node 10
-        assert_eq!(track.node_for_pair("station2", "track12"), Some(10));
-        assert_eq!(track.node_for_pair("station1", "station3"), None);
+    fn table_lists_stations_and_speed_tags() {
+        let track = fixture();
+        let table = track.table();
+        assert_eq!(table.tags.len(), track.stations.len() + track.speeds.len());
+        assert_eq!(table.station_uid("bar"), Some("AA000001"));
+        assert_eq!(
+            table.rule("BB000001"),
+            Some(&TagKind::Speed { speed: 0.4 })
+        );
     }
 
     #[test]
-    fn compile_from_known_node_stops_at_nearest_pass() {
-        let track = repo_track();
-        // just crossed node 0 (station1 eastbound), going to raucherecke
-        let legs = track.compile_route(Some(0), "raucherecke", None).unwrap();
-        let tags: Vec<&str> = legs.iter().map(|l| l.tag.as_str()).collect();
-        assert_eq!(tags, ["track12", "station2", "track23", "station3"]);
-        // cruise on plain track, pass-through cap at station2, approach at the end
-        assert_eq!(legs[0].speed, 0.6);
-        assert_eq!(legs[1].speed, 0.4);
-        assert_eq!(legs[3].speed, 0.35);
+    fn empty_tags_are_placeholders() {
+        let mut track = fixture();
+        track.stations[1].tag.clear();
+        track.speeds[0].tag.clear();
+        track.speeds.push(track.speeds[0].clone());
+        assert!(track.validate().is_ok(), "empty tags never clash");
+        let table = track.table();
+        assert_eq!(table.tags.len(), 1, "only the bar has a uid");
+        assert!(table.rule("").is_none());
     }
 
     #[test]
-    fn compile_applies_curve_speed_limits() {
-        let track = repo_track();
-        // from node 4 (entering loop B): the leg through the turnaround
-        // edge (node 5 -> 6) is capped at the curve's speed_limit
-        let legs = track.compile_route(Some(4), "raucherecke", None).unwrap();
-        let tags: Vec<&str> = legs.iter().map(|l| l.tag.as_str()).collect();
-        assert_eq!(tags, ["curveB1", "curveB2", "station3"]);
-        assert_eq!(legs[1].speed, 0.5, "turnaround edge capped");
-        assert_eq!(legs[2].speed, 0.35, "approach into the stop");
-    }
-
-    #[test]
-    fn compile_without_position_covers_the_full_ring() {
-        let track = repo_track();
-        let legs = track.compile_route(None, "bar", None).unwrap();
-        assert_eq!(legs.len(), track.nodes.len(), "full lap");
-        assert_eq!(legs.last().unwrap().tag, "station1");
-        // every ring tag appears, so any real position can resync
-        for node in &track.nodes {
-            assert!(
-                legs.iter().any(|l| l.tag == node.tag),
-                "{} missing",
-                node.tag
-            );
-        }
-    }
-
-    #[test]
-    fn compile_clamps_requested_speed() {
-        let track = repo_track();
-        let legs = track
-            .compile_route(Some(0), "schachbrett", Some(9.0))
-            .unwrap();
-        assert!(legs.iter().all(|l| l.speed <= track.train.max_speed));
-    }
-
-    #[test]
-    fn unknown_station_is_an_error() {
-        let track = repo_track();
-        assert!(track.compile_route(None, "forgot_name", None).is_err());
+    fn table_version_follows_content() {
+        let track = fixture();
+        assert_eq!(track.table().version, fixture().table().version);
+        let mut changed = fixture();
+        changed.speeds[0].speed /= 2.0;
+        assert_ne!(track.table().version, changed.table().version);
     }
 
     #[test]
     fn validation_rejects_broken_configs() {
-        let mut track = repo_track();
-        track.stations[0].approach_speed = 0.1; // 2000 ms / 0.1 = 20 s > watchdog
-        assert!(track.validate().is_err());
+        let mut track = fixture();
+        track.speeds[0].speed = 0.0;
+        assert!(track.validate().is_err(), "speed must be positive");
 
-        let mut track = repo_track();
-        track.train.accel = 0.1; // braking from 1.0 to 0.35 needs 6.5 s > edge
-        assert!(track.validate().is_err());
+        let mut track = fixture();
+        track.speeds[0].tag = track.stations[0].tag.clone();
+        assert!(track.validate().is_err(), "a tag has one meaning");
 
-        let mut track = repo_track();
-        track.nodes[7].tag = "track12".into(); // duplicates pair (curveB2? ->) — makes pairs collide
-        track.nodes[8].tag = "station2".into();
-        track.nodes[6].tag = "station1".into();
+        let mut track = fixture();
+        let dup = track.speeds[0].clone();
+        track.speeds.push(dup);
+        assert!(track.validate().is_err(), "duplicate speed tag");
+
+        let mut track = fixture();
+        track.stations[0].role = StationRole::Unload;
+        assert!(track.validate().is_err(), "refill.station must refill");
+
+        let mut track = fixture();
+        track.refill.station = "nowhere".into();
+        assert!(track.validate().is_err(), "refill.station must exist");
+
+        let mut track = fixture();
+        track.stations[1].then = Some("nowhere".into());
+        assert!(track.validate().is_err(), "then must be a station");
+
+        let mut track = fixture();
+        track.stations[1].then = Some("raucherecke".into());
+        assert!(track.validate().is_err(), "then must be another station");
+
+        let mut track = fixture();
+        track.stations[1].then = Some("bar".into());
+        assert!(track.validate().is_ok());
+
+        let mut track = fixture();
+        track.train.max_run_ms_without_tag = 0;
+        assert_eq!(track.train.watchdog_ms(), u32::MAX as u64, "0 = off");
+        track.train.max_run_ms_without_tag = 30_000;
+        assert_eq!(track.train.watchdog_ms(), 30_000);
+
+        let mut track = fixture();
+        track.train.start_speed = 1.5;
         assert!(track.validate().is_err());
     }
 }

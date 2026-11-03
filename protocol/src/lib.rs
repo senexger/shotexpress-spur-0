@@ -1,13 +1,15 @@
 //! MQTT wire types shared by the control server, the train simulator and
 //! (eventually) the real firmware.
 //!
-//! Design rule: the train is a dumb executor. It receives *data*, never
-//! logic — a `drive` command is an ordered list of legs ("drive at `speed`
-//! until you read `tag`"), compiled by the server from its track map. The
-//! train holds no map, runs autonomous rides forward-only (passive
-//! turnaround switches), and must be able to finish any single command
-//! with zero connectivity. `direction` exists only on `steps`, the
-//! precise-positioning primitive used under live server control (refill).
+//! Design rule (ETCS-style balises): every RFID tag is read from one side
+//! only, so a tag uid alone says where the train is and which way it goes.
+//! The server publishes the tag table (`shotexpress/track`, retained): each
+//! tag either sets the speed from here on, or is a station. A `drive` only
+//! names the target station; the train looks every read up in its cached
+//! table, so speed changes and the stop happen without a network round
+//! trip, and a ride finishes with zero connectivity. `direction` exists
+//! only on `steps`, the precise-positioning primitive used under live
+//! server control (refill).
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -31,6 +33,10 @@ pub const TOPIC_STEPS: &str = "shotexpress/steps";
 /// Start acceleration for the raw firmware, plain-text integer in steps/s².
 /// Retained like the speed. Stops stay instant. Test setup.
 pub const TOPIC_ACCEL: &str = "shotexpress/accel";
+
+/// The tag table (`TrackTable` JSON), published retained by the server so
+/// the train has it right after every (re)connect.
+pub const TOPIC_TRACK: &str = "shotexpress/track";
 
 pub const DEFAULT_TTL_MS: u64 = 60_000;
 
@@ -126,8 +132,9 @@ impl ExecKind {
 
 /// Well-known `ExecError::code` values emitted by the train:
 /// `RFID_TIMEOUT` (no tag within `max_run_ms_without_tag`, safe-stopped),
-/// `OVERSHOT` (missed the stop tag, safe-stopped one tag past the target),
-/// `UNEXPECTED_TAG` (tag not in the remaining legs, safe-stopped).
+/// `TRACK_MISMATCH` (no tag table, or not the `track_version` the ride was
+/// planned with; the ride is refused), `UNKNOWN_STATION` (the target is
+/// not a station in the table; refused).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecError {
     pub code: String,
@@ -186,28 +193,65 @@ pub struct CommandMessage {
     pub kind: CommandKind,
 }
 
-/// One leg of a drive: hold `speed` until `tag` is read. The speed applies
-/// on the track *leading to* the tag, so slowing before a curve or station
-/// is a matter of tag placement, decided by the server's map.
+// ---- tag table (shotexpress/track) ----
+
+/// Balise data: what each tag means. Unlisted tags are ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Leg {
-    pub tag: String,
-    pub speed: f64,
+pub struct TrackTable {
+    /// Hash of `tags`; a drive carries the version it was planned with.
+    pub version: u32,
+    pub tags: Vec<TagRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TagRule {
+    pub uid: String,
+    #[serde(flatten)]
+    pub kind: TagKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TagKind {
+    /// Drive at most `speed` (normalized 0..1) from this tag on.
+    Speed { speed: f64 },
+    /// A station: full stop here if it is the ride's target, else ignored.
+    Station { station: String },
+}
+
+impl TrackTable {
+    pub fn rule(&self, uid: &str) -> Option<&TagKind> {
+        self.tags.iter().find(|t| t.uid == uid).map(|t| &t.kind)
+    }
+
+    pub fn station_uid(&self, station: &str) -> Option<&str> {
+        self.tags.iter().find_map(|t| match &t.kind {
+            TagKind::Station { station: s } if s == station => Some(t.uid.as_str()),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd_type", rename_all = "snake_case")]
 pub enum CommandKind {
     Stop,
-    /// Autonomous ride, forward-only. The last leg's tag is the stop tag;
-    /// empty `legs` means "come to a stop" and completes immediately.
-    /// Offline-completable: everything needed is in the payload.
+    /// Autonomous ride, forward-only, to the station `target`. Speed tags
+    /// from the cached table set the speed (capped at `max_speed`); the
+    /// target's station tag is a full stop. Offline-completable.
     Drive {
-        legs: Vec<Leg>,
+        target: String,
+        /// Cap on every tag speed for this ride.
+        max_speed: f64,
+        /// Speed until the first speed tag, when the train doesn't know
+        /// which speed zone it stands in.
+        start_speed: f64,
         /// Speed ramp rate in normalized speed units per second (gentle
         /// ramps keep the shots in their glasses).
         accel: f64,
         max_run_ms_without_tag: u64,
+        /// `TrackTable::version` the server planned with.
+        track_version: u32,
         ttl_ms: u64,
     },
     /// Precise positioning by step count. The only command that may go
@@ -487,22 +531,12 @@ mod tests {
         let command = CommandMessage {
             envelope: envelope(),
             kind: CommandKind::Drive {
-                legs: vec![
-                    Leg {
-                        tag: "track12".into(),
-                        speed: 0.8,
-                    },
-                    Leg {
-                        tag: "curveA2".into(),
-                        speed: 0.3,
-                    },
-                    Leg {
-                        tag: "station3".into(),
-                        speed: 0.25,
-                    },
-                ],
+                target: "bar".into(),
+                max_speed: 0.8,
+                start_speed: 0.3,
                 accel: 0.5,
                 max_run_ms_without_tag: 7_000,
+                track_version: 12345,
                 ttl_ms: DEFAULT_TTL_MS,
             },
         };
@@ -512,13 +546,12 @@ mod tests {
             "seq": 3,
             "ts_ms": 1751500000000u64,
             "cmd_type": "drive",
-            "legs": [
-                {"tag": "track12", "speed": 0.8},
-                {"tag": "curveA2", "speed": 0.3},
-                {"tag": "station3", "speed": 0.25}
-            ],
+            "target": "bar",
+            "max_speed": 0.8,
+            "start_speed": 0.3,
             "accel": 0.5,
             "max_run_ms_without_tag": 7000,
+            "track_version": 12345,
             "ttl_ms": 60000
         });
         assert_eq!(serde_json::to_value(&command).unwrap(), expected);
@@ -529,6 +562,23 @@ mod tests {
             parsed.kind,
             CommandKind::Drive { ttl_ms: 60000, .. }
         ));
+    }
+
+    #[test]
+    fn track_table_golden_wire_shape() {
+        let raw = json!({
+            "version": 42,
+            "tags": [
+                {"uid": "A1B2C3D4", "kind": "speed", "speed": 0.5},
+                {"uid": "93E0CD1C", "kind": "station", "station": "bar"}
+            ]
+        });
+        let table: TrackTable = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&table).unwrap(), raw);
+        assert_eq!(table.rule("A1B2C3D4"), Some(&TagKind::Speed { speed: 0.5 }));
+        assert_eq!(table.rule("nope"), None);
+        assert_eq!(table.station_uid("bar"), Some("93E0CD1C"));
+        assert_eq!(table.station_uid("schachbrett"), None);
     }
 
     #[test]
@@ -545,9 +595,11 @@ mod tests {
                 "cmd_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
                 "seq": 2, "ts_ms": 1751500000000u64,
                 "cmd_type": "drive",
-                "legs": [],
+                "target": "schachbrett",
+                "max_speed": 1.0, "start_speed": 0.3,
                 "accel": 0.5,
                 "max_run_ms_without_tag": 7000,
+                "track_version": 1,
                 "ttl_ms": 15000
             }),
             json!({

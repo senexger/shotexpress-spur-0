@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ec0016">
+  <meta name="color-scheme" content="only light">
+  <title>ShotExpress – Shots bestellen</title>
+  <link rel="icon" href="/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/order.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="logo" href="/" aria-label="ShotExpress Startseite"><img src="/logo.svg" alt="ShotExpress"></a>
+      <nav class="mainnav" aria-label="Hauptnavigation">
+        <a class="active" href="/">Reiseauskunft</a>
+        <a href="#fahrplan">Fahrplan</a>
+        <a href="/admin">Betrieb</a>
+      </nav>
+      <div class="topbar-right">
+        <span class="lang">DE</span>
+        <span class="account" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="8" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <div id="notice" class="notice" hidden></div>
+
+  <main>
+    <section class="hero">
+      <img class="hero-art" src="/banner.jpg" alt="" aria-hidden="true">
+      <div class="hero-text">
+        <h1>ShotExpress Navigator</h1>
+        <p>Die Durststrecke zwischen Bar und Raucherraum wird wieder befahren!</p>
+      </div>
+    </section>
+
+    <section class="search-wrap">
+      <form id="order-form" class="search-card" autocomplete="off">
+        <div class="tabs" role="tablist">
+          <button type="button" class="tab active" role="tab" aria-selected="true">Shot-Verbindung</button>
+          <button type="button" class="tab" role="tab" aria-selected="false" disabled title="Gibt's nicht. Wer zurückfährt, hat nicht genug getrunken.">Hin- und Rückfahrt</button>
+        </div>
+
+        <div class="route">
+          <div class="field">
+            <label for="from">Von</label>
+            <div class="input locked">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="5" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+              <input id="from" value="Bar" readonly>
+              <svg class="lock" viewBox="0 0 24 24" width="16" height="16" aria-label="fest"><rect x="5" y="11" width="14" height="10" rx="2" fill="currentColor"/><path d="M8 11V8a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+            </div>
+          </div>
+          <button type="button" class="swap" disabled title="Die Bar bleibt, wo sie ist." aria-label="Start und Ziel tauschen">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M7 4v14m0 0-3-3m3 3 3-3M17 20V6m0 0-3 3m3-3 3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="field">
+            <label for="to">Nach</label>
+            <div class="input">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 22s7-6.5 7-12a7 7 0 0 0-14 0c0 5.5 7 12 7 12z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="10" r="2.5" fill="currentColor"/></svg>
+              <select id="to" required>
+                <option value="" disabled selected>Zielbahnhof wählen</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="details">
+          <div class="field">
+            <label>Hinfahrt</label>
+            <div class="input static">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 10h18M8 3v4M16 3v4" stroke="currentColor" stroke-width="2"/></svg>
+              <span>Jetzt, <span id="now"></span></span>
+            </div>
+          </div>
+          <div class="field">
+            <label for="shots">Anzahl Shots</label>
+            <div class="input stepper">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M6 4h12l-1.6 15.2a2 2 0 0 1-2 1.8H9.6a2 2 0 0 1-2-1.8z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M7 9h10" stroke="currentColor" stroke-width="2"/></svg>
+              <button type="button" class="step" data-step="-1" aria-label="Weniger Shots">−</button>
+              <input id="shots" type="number" inputmode="numeric" min="1" max="6" value="2" required>
+              <button type="button" class="step" data-step="1" aria-label="Mehr Shots">+</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <label class="check">
+            <input type="checkbox" checked disabled>
+            <span>Nur Direktverbindungen</span>
+          </label>
+          <button id="submit" class="primary" type="submit">Bestellen</button>
+        </div>
+        <p id="form-error" class="form-error" role="alert" hidden></p>
+      </form>
+    </section>
+
+    <section id="trip" class="trip" hidden aria-live="polite">
+      <h2>Ihre Bestellung</h2>
+      <article class="connection">
+        <div class="conn-head">
+          <div class="times">
+            <span class="time" id="t-dep"></span>
+            <span class="line"></span>
+            <span class="time" id="t-arr"></span>
+          </div>
+          <span class="badge" id="t-train"></span>
+        </div>
+        <div class="conn-stations">
+          <span id="t-from"></span>
+          <span id="t-to"></span>
+        </div>
+        <div id="t-status" class="conn-status"></div>
+        <ol class="route-list" id="t-steps"></ol>
+        <div class="conn-foot">
+          <span id="t-shots"></span>
+          <button type="button" id="t-new" class="secondary">Neue Bestellung</button>
+        </div>
+      </article>
+    </section>
+
+    <section id="fahrplan" class="board">
+      <h2>Abfahrtstafel Bar</h2>
+      <div class="board-table" id="board">
+        <p class="muted">Noch keine Bestellungen eingetroffen.</p>
+      </div>
+    </section>
+
+    <section class="tiles">
+      <div class="tile">
+        <h3>Sparpreis</h3>
+        <p>Jeder Shot zum Festpreis: 0,00 €. Gültig, solange der Tank reicht.</p>
+      </div>
+      <div class="tile">
+        <h3>BahnBonus</h3>
+        <p>Ab dem 5. Shot sammeln Sie automatisch Erinnerungslücken.</p>
+      </div>
+      <div class="tile">
+        <h3>Komfort-Knock-Out</h3>
+        <p>Das Leben in vollen Zügen genießen.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span class="logo small"><img src="/logo.svg" alt=""></span>
+      <p>Wer hat behauptet, der ShotExpress sei eine Schnapsidee?</p>
+      <p>*Bitte nicht ins Pissoir kotzen.</p>
+    </div>
+  </footer>
+
+  <script src="/order.js"></script>
+</body>
+</html>

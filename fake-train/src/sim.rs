@@ -1,24 +1,25 @@
 //! Headless simulation core: physics, train state machine and MQTT command
 //! semantics. No tokio, no network — fully driveable from unit tests with a
 //! synthetic clock. Behaves like the target Train.ino firmware contract:
-//! a dumb executor for `drive` leg schedules and `steps` nudges.
+//! a dumb executor for `drive` rides against the cached tag table, and
+//! `steps` nudges.
 //!
 //! The train only ever runs forward on autonomous rides: the passive
 //! switches route it around the turnaround loops, so "going back" means
 //! continuing forward through the next turnaround. Backward motion exists
 //! only for `steps` (refill positioning) and the raw manual "2".
 //!
-//! Failure reflexes, in order of preference: resync forward past missed
-//! reads (harmless on a one-way ring), safe-stop and report when the world
-//! contradicts the schedule (`OVERSHOT`, `UNEXPECTED_TAG`), safe-stop on
-//! the RFID watchdog. Never improvise a new plan — that's the server's job.
+//! Each read is looked up on its own: a speed tag sets the speed, the
+//! target's station tag stops, everything else is driven past. A missed
+//! stop tag just means another lap. Rides planned with a different table
+//! version are refused (`TRACK_MISMATCH`); the RFID watchdog safe-stops.
 
 use std::collections::HashSet;
 
 use rand::RngExt;
 use shotexpress_protocol::{
-    CmdId, CommandKind, CommandMessage, Direction, Envelope, ExecError, ExecEvent, ExecKind, Leg,
-    StatusMessage, TrainState,
+    CmdId, CommandKind, CommandMessage, Direction, Envelope, ExecError, ExecEvent, ExecKind,
+    StatusMessage, TagKind, TrackTable, TrainState,
 };
 use uuid::Uuid;
 
@@ -50,7 +51,7 @@ pub enum SimOutput {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MotorMode {
     Stopped,
-    /// Executing a drive leg schedule (always forward).
+    /// Executing a ride (always forward).
     Drive,
     /// Fixed step count, forward or backward (JSON steps or raw "1").
     Steps {
@@ -66,8 +67,10 @@ pub enum MotorMode {
 pub enum Active {
     Drive {
         cmd_id: CmdId,
-        /// Remaining legs, front = current. The last one is the stop tag.
-        legs: Vec<Leg>,
+        target: String,
+        /// The target station's tag: reading it is a full stop.
+        target_uid: String,
+        max_speed: f64,
         ms_since_last_tag: f64,
         max_run_ms_without_tag: u64,
         distance_m: f64,
@@ -85,6 +88,17 @@ impl Active {
     }
 }
 
+/// A `drive` command's fields.
+pub struct DriveParams {
+    pub target: String,
+    pub max_speed: f64,
+    pub start_speed: f64,
+    pub accel: f64,
+    pub max_run_ms_without_tag: u64,
+    pub track_version: u32,
+    pub ttl_ms: u64,
+}
+
 pub struct Simulator {
     pub truth: RingPos,
     pub motor: MotorMode,
@@ -94,6 +108,10 @@ pub struct Simulator {
     pub accel: f64,
     pub state: TrainState,
     pub localizer: Localizer,
+    /// Tag table from the server (retained shotexpress/track).
+    pub table: Option<TrackTable>,
+    /// Last speed tag read, ride or not; None until the first one.
+    pub zone_speed: Option<f64>,
     pub loaded: bool,
     pub battery_pct: u8,
     pub active: Option<Active>,
@@ -120,6 +138,8 @@ impl Simulator {
             accel: DEFAULT_ACCEL,
             state: TrainState::Idle,
             localizer: Localizer::new(),
+            table: None,
+            zone_speed: None,
             loaded: true,
             battery_pct: 86,
             active: None,
@@ -133,6 +153,18 @@ impl Simulator {
     }
 
     // ---- incoming commands ----
+
+    /// Retained tag table from the server.
+    pub fn handle_track(&mut self, payload: &[u8]) -> Vec<SimOutput> {
+        match serde_json::from_slice::<TrackTable>(payload) {
+            Ok(table) => {
+                let log = format!("tag table v{}: {} tags", table.version, table.tags.len());
+                self.table = Some(table);
+                vec![SimOutput::Log(log)]
+            }
+            Err(err) => vec![SimOutput::Log(format!("unparseable tag table: {err}"))],
+        }
+    }
 
     pub fn handle_payload(&mut self, payload: &[u8], now_ms: u64) -> Vec<SimOutput> {
         let text = String::from_utf8_lossy(payload);
@@ -163,16 +195,24 @@ impl Simulator {
 
         match command.kind {
             CommandKind::Drive {
-                legs,
+                target,
+                max_speed,
+                start_speed,
                 accel,
                 max_run_ms_without_tag,
+                track_version,
                 ttl_ms,
             } => self.handle_drive(
                 &command.envelope,
-                legs,
-                accel,
-                max_run_ms_without_tag,
-                ttl_ms,
+                DriveParams {
+                    target,
+                    max_speed,
+                    start_speed,
+                    accel,
+                    max_run_ms_without_tag,
+                    track_version,
+                    ttl_ms,
+                },
                 now_ms,
             ),
             CommandKind::Steps {
@@ -189,22 +229,13 @@ impl Simulator {
         }
     }
 
-    fn handle_drive(
-        &mut self,
-        envelope: &Envelope,
-        legs: Vec<Leg>,
-        accel: f64,
-        max_run_ms_without_tag: u64,
-        ttl_ms: u64,
-        now_ms: u64,
-    ) -> Vec<SimOutput> {
+    fn handle_drive(&mut self, envelope: &Envelope, p: DriveParams, now_ms: u64) -> Vec<SimOutput> {
         let mut out = vec![SimOutput::Log(format!(
-            "cmd drive {} leg(s), stop at {}, ttl={ttl_ms}ms",
-            legs.len(),
-            legs.last().map(|l| l.tag.as_str()).unwrap_or("-"),
+            "cmd drive to {}, cap {:.2}, ttl={}ms",
+            p.target, p.max_speed, p.ttl_ms
         ))];
 
-        if now_ms > envelope.ts_ms.saturating_add(ttl_ms) {
+        if now_ms > envelope.ts_ms.saturating_add(p.ttl_ms) {
             out.push(SimOutput::Exec(self.exec(
                 envelope.cmd_id,
                 ExecKind::Expired,
@@ -213,6 +244,43 @@ impl Simulator {
             return out;
         }
 
+        let refuse = |code: &str, reason: String| ExecKind::Failed {
+            error: ExecError {
+                code: code.into(),
+                reason,
+            },
+        };
+        let target_uid = match &self.table {
+            Some(table) if table.version == p.track_version => {
+                match table.station_uid(&p.target) {
+                    Some(uid) => uid.to_string(),
+                    None => {
+                        let kind = refuse(
+                            "UNKNOWN_STATION",
+                            format!("no station {} in the tag table", p.target),
+                        );
+                        out.push(SimOutput::Exec(self.exec(envelope.cmd_id, kind, now_ms)));
+                        return out;
+                    }
+                }
+            }
+            other => {
+                let have = other
+                    .as_ref()
+                    .map(|t| format!("v{}", t.version))
+                    .unwrap_or_else(|| "none".into());
+                let kind = refuse(
+                    "TRACK_MISMATCH",
+                    format!(
+                        "ride planned with tag table v{}, train has {have}",
+                        p.track_version
+                    ),
+                );
+                out.push(SimOutput::Exec(self.exec(envelope.cmd_id, kind, now_ms)));
+                return out;
+            }
+        };
+
         out.extend(self.cancel_active(now_ms));
         out.push(SimOutput::Exec(self.exec(
             envelope.cmd_id,
@@ -220,37 +288,20 @@ impl Simulator {
             now_ms,
         )));
 
-        // empty schedule = "come to a stop": completes on the spot
-        let Some(first) = legs.first() else {
-            self.motor = MotorMode::Stopped;
-            self.speed = 0.0;
-            self.target_speed = 0.0;
-            self.set_state(TrainState::Idle, now_ms, &mut out);
-            out.push(SimOutput::Exec(self.exec(
-                envelope.cmd_id,
-                ExecKind::Completed,
-                now_ms,
-            )));
-            return out;
-        };
-
-        self.accel = accel.max(0.01);
-        self.target_speed = first.speed.clamp(MIN_SPEED, 1.0);
+        self.accel = p.accel.max(0.01);
+        let speed = self.zone_speed.unwrap_or(p.start_speed).min(p.max_speed);
+        self.target_speed = speed.clamp(MIN_SPEED, 1.0);
         self.motor = MotorMode::Drive;
-        let approach = legs.len() == 1;
         self.active = Some(Active::Drive {
             cmd_id: envelope.cmd_id,
-            legs,
+            target: p.target,
+            target_uid,
+            max_speed: p.max_speed,
             ms_since_last_tag: 0.0,
-            max_run_ms_without_tag,
+            max_run_ms_without_tag: p.max_run_ms_without_tag,
             distance_m: 0.0,
         });
-        let state = if approach {
-            TrainState::Approach
-        } else {
-            TrainState::Running
-        };
-        self.set_state(state, now_ms, &mut out);
+        self.set_state(TrainState::Running, now_ms, &mut out);
         out
     }
 
@@ -586,9 +637,16 @@ impl Simulator {
             }
         }
 
+        // the speed zone is tracked on every forward read, ride or not
+        let rule = self.table.as_ref().and_then(|t| t.rule(tag)).cloned();
+        if !backward && let Some(TagKind::Speed { speed }) = &rule {
+            self.zone_speed = Some(*speed);
+        }
+
         let Some(Active::Drive {
             cmd_id,
-            legs,
+            target_uid,
+            max_speed,
             ms_since_last_tag,
             distance_m,
             ..
@@ -598,73 +656,39 @@ impl Simulator {
         };
         *ms_since_last_tag = 0.0;
         let cmd_id = *cmd_id;
+        let max_speed = *max_speed;
         let distance_m = (*distance_m * 10.0).round() / 10.0;
 
-        // the local ruleset: match the read against the remaining schedule
-        match legs.iter().position(|leg| leg.tag == tag) {
-            Some(k) => {
-                let skipped = k as u32;
-                legs.drain(..=k);
-                if legs.is_empty() {
-                    // arrival (possibly resynced straight onto the stop tag)
-                    self.active = None;
-                    self.motor = MotorMode::Stopped;
-                    self.speed = 0.0;
-                    self.target_speed = 0.0;
-                    self.dwell_remaining_ms = DWELL_MS;
-                    self.set_state(TrainState::Dwell, now_ms, out);
-                    out.push(SimOutput::Exec(self.exec(
-                        cmd_id,
-                        ExecKind::Completed,
-                        now_ms,
-                    )));
-                    return (true, true);
-                }
-
-                self.target_speed = legs[0].speed.clamp(MIN_SPEED, 1.0);
-                let approach = legs.len() == 1;
-                out.push(SimOutput::Exec(self.exec(
-                    cmd_id,
-                    ExecKind::Progress {
-                        last_tag: tag.to_string(),
-                        distance_m,
-                        skipped,
-                    },
-                    now_ms,
-                )));
-                if approach && self.state == TrainState::Running {
-                    self.set_state(TrainState::Approach, now_ms, out);
-                }
-                (true, false)
-            }
-            None => {
-                // stupid-train heuristic: an unknown tag while only the stop
-                // tag remained means we rolled past it
-                let (code, reason) = if legs.len() == 1 {
-                    (
-                        "OVERSHOT",
-                        format!("missed stop tag {}, read {tag} instead", legs[0].tag),
-                    )
-                } else {
-                    (
-                        "UNEXPECTED_TAG",
-                        format!("tag {tag} is not in the remaining schedule"),
-                    )
-                };
-                self.safe_stop(now_ms, out);
-                out.push(SimOutput::Exec(self.exec(
-                    cmd_id,
-                    ExecKind::Failed {
-                        error: ExecError {
-                            code: code.into(),
-                            reason,
-                        },
-                    },
-                    now_ms,
-                )));
-                (true, true)
-            }
+        if tag == target_uid.as_str() {
+            // the target's station tag: full stop
+            self.active = None;
+            self.motor = MotorMode::Stopped;
+            self.speed = 0.0;
+            self.target_speed = 0.0;
+            self.dwell_remaining_ms = DWELL_MS;
+            self.set_state(TrainState::Dwell, now_ms, out);
+            out.push(SimOutput::Exec(self.exec(
+                cmd_id,
+                ExecKind::Completed,
+                now_ms,
+            )));
+            return (true, true);
         }
+
+        if let Some(TagKind::Speed { speed }) = rule {
+            self.target_speed = speed.min(max_speed).clamp(MIN_SPEED, 1.0);
+        }
+        // other stations and unlisted tags: drive on
+        out.push(SimOutput::Exec(self.exec(
+            cmd_id,
+            ExecKind::Progress {
+                last_tag: tag.to_string(),
+                distance_m,
+                skipped: 0,
+            },
+            now_ms,
+        )));
+        (true, false)
     }
 
     // ---- outgoing messages ----
@@ -716,13 +740,35 @@ impl Simulator {
 mod tests {
     use super::*;
     use crate::belief::Belief;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     const T0: u64 = 1_783_000_000_000;
+    const VERSION: u32 = 7;
+
+    /// Mirrors the repo track.toml (stations on the eastbound pass, slow
+    /// curves) with the simulator's tag names.
+    fn table() -> Vec<u8> {
+        json!({
+            "version": VERSION,
+            "tags": [
+                {"uid": "station1", "kind": "station", "station": "bar"},
+                {"uid": "station2", "kind": "station", "station": "schachbrett"},
+                {"uid": "station3", "kind": "station", "station": "raucherecke"},
+                {"uid": "track12", "kind": "speed", "speed": 0.6},
+                {"uid": "curveB1", "kind": "speed", "speed": 0.5},
+                {"uid": "curveB2", "kind": "speed", "speed": 1.0},
+                {"uid": "curveA1", "kind": "speed", "speed": 0.5},
+                {"uid": "curveA2", "kind": "speed", "speed": 0.6}
+            ]
+        })
+        .to_string()
+        .into_bytes()
+    }
 
     fn sim_at(edge: usize, frac: f64) -> Simulator {
         let mut sim = Simulator::new(&mut rand::rng(), T0);
         sim.truth = RingPos { edge, frac };
+        sim.handle_track(&table());
         // tests reason about tag gaps, not ramp physics: start rides at
         // cruise instantly unless a test opts back in
         sim.speed = 0.6;
@@ -730,25 +776,24 @@ mod tests {
         sim
     }
 
-    fn drive_payload(legs: &[(&str, f64)], ts_ms: u64, ttl_ms: u64) -> Vec<u8> {
-        drive_payload_accel(legs, 1e9, ts_ms, ttl_ms)
-    }
-
-    fn drive_payload_accel(legs: &[(&str, f64)], accel: f64, ts_ms: u64, ttl_ms: u64) -> Vec<u8> {
+    fn drive(target: &str) -> Value {
         json!({
             "msg_id": Uuid::new_v4().to_string(),
             "cmd_id": Uuid::new_v4().to_string(),
-            "seq": 1, "ts_ms": ts_ms,
+            "seq": 1, "ts_ms": T0,
             "cmd_type": "drive",
-            "legs": legs.iter()
-                .map(|(tag, speed)| json!({"tag": tag, "speed": speed}))
-                .collect::<Vec<_>>(),
-            "accel": accel,
+            "target": target,
+            "max_speed": 1.0,
+            "start_speed": 0.6,
+            "accel": 1e9,
             "max_run_ms_without_tag": 7000,
-            "ttl_ms": ttl_ms
+            "track_version": VERSION,
+            "ttl_ms": 60000
         })
-        .to_string()
-        .into_bytes()
+    }
+
+    fn send(sim: &mut Simulator, payload: &Value) -> Vec<SimOutput> {
+        sim.handle_payload(payload.to_string().as_bytes(), T0)
     }
 
     fn steps_payload(steps: u32, direction: &str, speed: f64, ts_ms: u64) -> Vec<u8> {
@@ -770,10 +815,7 @@ mod tests {
             .filter_map(|o| match o {
                 SimOutput::Exec(e) => Some(match &e.kind {
                     ExecKind::Accepted => "accepted".to_string(),
-                    ExecKind::Progress { skipped, .. } if *skipped > 0 => {
-                        format!("progress+{skipped}")
-                    }
-                    ExecKind::Progress { .. } => "progress".to_string(),
+                    ExecKind::Progress { last_tag, .. } => format!("progress:{last_tag}"),
                     ExecKind::Completed => "completed".to_string(),
                     ExecKind::Failed { error } => format!("failed:{}", error.code),
                     ExecKind::Cancelled => "cancelled".to_string(),
@@ -797,24 +839,35 @@ mod tests {
         out
     }
 
+    /// Run until `tag` is read (panics after 60 s of sim time).
+    fn run_until_tag(sim: &mut Simulator, tag: &str) -> Vec<SimOutput> {
+        let mut out = Vec::new();
+        let mut clock = T0;
+        for _ in 0..1500 {
+            clock += 40;
+            let step = sim.tick(40.0, clock);
+            let hit = step.iter().any(|o| matches!(o, SimOutput::Tag(t) if t == tag));
+            out.extend(step);
+            if hit {
+                return out;
+            }
+        }
+        panic!("never read {tag}");
+    }
+
     #[test]
     fn happy_path_drive_to_station() {
         // start just past station1 heading east; stop at station2
         let mut sim = sim_at(0, 0.1);
-        let out = sim.handle_payload(
-            &drive_payload(&[("track12", 0.6), ("station2", 0.35)], T0, 60_000),
-            T0,
-        );
+        let out = send(&mut sim, &drive("schachbrett"));
         assert_eq!(exec_kinds(&out), vec!["accepted"]);
         assert_eq!(sim.state, TrainState::Running);
 
         let out = run(&mut sim, 30_000);
-        let kinds = exec_kinds(&out);
-        assert_eq!(kinds, vec!["progress", "completed"]);
+        assert_eq!(exec_kinds(&out), vec!["progress:track12", "completed"]);
         assert_eq!(sim.state, TrainState::Idle, "back to IDLE after dwell");
         assert!(sim.active.is_none());
         assert_eq!(sim.truth.edge, 2, "stopped on the station2 node");
-        // distances are monotone and rounded to 0.1
         let progress_distance = out.iter().find_map(|o| match o {
             SimOutput::Exec(ExecEvent {
                 kind: ExecKind::Progress { distance_m, .. },
@@ -826,98 +879,103 @@ mod tests {
     }
 
     #[test]
-    fn approach_state_on_final_leg() {
+    fn other_stations_are_driven_past() {
         let mut sim = sim_at(0, 0.1);
-        sim.handle_payload(
-            &drive_payload(&[("track12", 0.6), ("station2", 0.35)], T0, 60_000),
-            T0,
-        );
-        let out = run(&mut sim, 4_000); // crosses track12, one leg left
-        assert!(
-            out.iter()
-                .any(|o| matches!(o, SimOutput::Status(s) if s.state == TrainState::Approach)),
-            "APPROACH once only the stop leg remains"
-        );
-        assert_eq!(sim.target_speed, 0.35, "crawling toward the stop tag");
-    }
-
-    #[test]
-    fn legs_carry_the_speed_schedule() {
-        let mut sim = sim_at(4, 0.05); // entering loop B
-        // 0.5 on the curve leg mirrors track.toml's turnaround speed_limit:
-        // 2500 ms / 0.5 = 5000 ms stays under the 7 s watchdog
-        sim.handle_payload(
-            &drive_payload(
-                &[("curveB1", 0.8), ("curveB2", 0.5), ("station3", 0.35)],
-                T0,
-                60_000,
-            ),
-            T0,
-        );
-        run(&mut sim, 3_000); // crossed curveB1 -> curve leg active
-        assert_eq!(sim.target_speed, 0.5, "slow through the turnaround");
-        let out = run(&mut sim, 40_000);
-        assert_eq!(
-            exec_kinds(&out).last().map(String::as_str),
-            Some("completed")
-        );
-        assert_eq!(sim.truth.edge, 7, "arrived at westbound station3 node");
-    }
-
-    #[test]
-    fn missed_tag_resyncs_forward() {
-        let mut sim = sim_at(0, 0.1);
-        sim.miss_next_tags = 1; // track12 read fails
-        sim.handle_payload(
-            &drive_payload(
-                &[("track12", 0.6), ("station2", 0.6), ("track23", 0.35)],
-                T0,
-                60_000,
-            ),
-            T0,
-        );
+        send(&mut sim, &drive("raucherecke"));
         let out = run(&mut sim, 30_000);
-        let kinds = exec_kinds(&out);
-        // station2 arrives with skipped=1, then the stop tag
-        assert_eq!(kinds, vec!["progress+1", "completed"]);
-        assert_eq!(sim.state, TrainState::Idle);
-    }
-
-    #[test]
-    fn missed_stop_tag_is_overshot() {
-        // 0.6 keeps two blind edges under the 7 s watchdog, so the next
-        // tag (station2) arrives and exposes the overshoot
-        let mut sim = sim_at(0, 0.1);
-        sim.miss_next_tags = 1; // the stop tag read fails
-        sim.handle_payload(&drive_payload(&[("track12", 0.6)], T0, 60_000), T0);
-        let out = run(&mut sim, 10_000);
-        assert_eq!(exec_kinds(&out), vec!["failed:OVERSHOT"]);
-        assert_eq!(sim.state, TrainState::SafeStop);
-        assert!(sim.active.is_none());
-        assert_eq!(sim.truth.edge, 2, "stopped one tag past the target");
-    }
-
-    #[test]
-    fn foreign_tag_is_unexpected() {
-        // schedule says loop B, but the train is on the eastbound main line
-        let mut sim = sim_at(0, 0.1);
-        sim.handle_payload(
-            &drive_payload(&[("curveB1", 0.6), ("curveB2", 0.35)], T0, 60_000),
-            T0,
+        assert_eq!(
+            exec_kinds(&out),
+            vec![
+                "progress:track12",
+                "progress:station2",
+                "progress:track23",
+                "completed"
+            ]
         );
-        let out = run(&mut sim, 10_000);
-        assert_eq!(exec_kinds(&out), vec!["failed:UNEXPECTED_TAG"]);
-        assert_eq!(sim.state, TrainState::SafeStop);
+        assert_eq!(sim.truth.edge, 4);
     }
 
     #[test]
-    fn empty_legs_completes_on_the_spot() {
+    fn speed_tags_set_the_speed() {
+        let mut sim = sim_at(4, 0.05); // entering loop B
+        send(&mut sim, &drive("bar"));
+        run_until_tag(&mut sim, "curveB1");
+        assert_eq!(sim.target_speed, 0.5, "slow through the turnaround");
+        run_until_tag(&mut sim, "curveB2");
+        assert_eq!(sim.target_speed, 1.0, "curve done");
+        // westbound tags are unlisted: speed stays
+        run_until_tag(&mut sim, "west2");
+        assert_eq!(sim.target_speed, 1.0);
+        let out = run(&mut sim, 40_000);
+        assert!(exec_kinds(&out).contains(&"completed".to_string()));
+        assert_eq!(sim.truth.edge, 0, "stopped at bar (station1)");
+    }
+
+    #[test]
+    fn ride_max_speed_caps_tag_speeds() {
+        let mut sim = sim_at(5, 0.5);
+        let mut cmd = drive("bar");
+        cmd["max_speed"] = json!(0.3);
+        send(&mut sim, &cmd);
+        run_until_tag(&mut sim, "curveB2"); // a 1.0 tag
+        assert_eq!(sim.target_speed, 0.3);
+    }
+
+    #[test]
+    fn start_speed_until_the_zone_is_known() {
         let mut sim = sim_at(0, 0.1);
-        sim.handle_payload(&drive_payload(&[("track12", 0.6)], T0, 60_000), T0);
-        let out = sim.handle_payload(&drive_payload(&[], T0, 60_000), T0);
-        assert_eq!(exec_kinds(&out), vec!["cancelled", "accepted", "completed"]);
-        assert_eq!(sim.state, TrainState::Idle);
+        send(&mut sim, &drive("schachbrett"));
+        assert_eq!(sim.target_speed, 0.6, "start_speed: zone unknown");
+
+        let mut sim = sim_at(0, 0.1);
+        sim.zone_speed = Some(0.4);
+        send(&mut sim, &drive("schachbrett"));
+        assert_eq!(sim.target_speed, 0.4, "remembered zone");
+    }
+
+    #[test]
+    fn zone_is_tracked_outside_rides() {
+        let mut sim = sim_at(4, 0.5);
+        sim.handle_payload(b"3", T0); // raw forward, no ride
+        run_until_tag(&mut sim, "curveB1");
+        assert_eq!(sim.zone_speed, Some(0.5));
+    }
+
+    #[test]
+    fn missed_stop_tag_means_another_lap() {
+        let mut sim = sim_at(0, 0.1);
+        send(&mut sim, &drive("schachbrett"));
+        run_until_tag(&mut sim, "track12");
+        sim.miss_next_tags = 1; // the station2 read fails
+        let out = run(&mut sim, 120_000);
+        let kinds = exec_kinds(&out);
+        assert!(kinds.contains(&"progress:west2".to_string()), "went round");
+        assert_eq!(kinds.last().map(String::as_str), Some("completed"));
+        assert_eq!(sim.truth.edge, 2);
+    }
+
+    #[test]
+    fn stale_or_missing_table_is_refused() {
+        let mut sim = sim_at(0, 0.1);
+        let mut cmd = drive("bar");
+        cmd["track_version"] = json!(VERSION + 1);
+        let out = send(&mut sim, &cmd);
+        assert_eq!(exec_kinds(&out), vec!["failed:TRACK_MISMATCH"]);
+        assert!(sim.active.is_none());
         assert_eq!(sim.motor, MotorMode::Stopped);
+
+        let mut sim = sim_at(0, 0.1);
+        sim.table = None;
+        let out = send(&mut sim, &drive("bar"));
+        assert_eq!(exec_kinds(&out), vec!["failed:TRACK_MISMATCH"]);
+    }
+
+    #[test]
+    fn unknown_station_is_refused() {
+        let mut sim = sim_at(0, 0.1);
+        let out = send(&mut sim, &drive("mond"));
+        assert_eq!(exec_kinds(&out), vec!["failed:UNKNOWN_STATION"]);
+        assert!(sim.active.is_none());
     }
 
     #[test]
@@ -946,8 +1004,9 @@ mod tests {
     fn speed_ramps_gently_toward_target() {
         let mut sim = sim_at(0, 0.1);
         sim.speed = 0.0;
-        let payload = drive_payload_accel(&[("track12", 0.6), ("station2", 0.6)], 0.5, T0, 60_000);
-        sim.handle_payload(&payload, T0);
+        let mut cmd = drive("schachbrett");
+        cmd["accel"] = json!(0.5);
+        send(&mut sim, &cmd);
         sim.tick(40.0, T0 + 40);
         assert!(
             sim.speed > 0.0 && sim.speed < 0.1,
@@ -955,14 +1014,15 @@ mod tests {
             sim.speed
         );
         run(&mut sim, 2_000);
-        assert!((sim.speed - 0.6).abs() < 1e-9, "reached cruise");
+        assert!((sim.speed - 0.6).abs() < 1e-9, "reached start speed");
     }
 
     #[test]
     fn ttl_expired_command_is_rejected() {
         let mut sim = sim_at(0, 0.1);
-        let stale = drive_payload(&[("track12", 0.6)], T0 - 120_000, 60_000);
-        let out = sim.handle_payload(&stale, T0);
+        let mut cmd = drive("bar");
+        cmd["ts_ms"] = json!(T0 - 120_000);
+        let out = send(&mut sim, &cmd);
         assert_eq!(exec_kinds(&out), vec!["expired"]);
         assert_eq!(sim.state, TrainState::Idle);
         assert!(sim.active.is_none());
@@ -971,23 +1031,18 @@ mod tests {
     #[test]
     fn duplicate_msg_id_is_ignored() {
         let mut sim = sim_at(0, 0.1);
-        let payload = drive_payload(&[("track12", 0.6), ("station2", 0.35)], T0, 60_000);
-        let first = sim.handle_payload(&payload, T0);
-        assert_eq!(exec_kinds(&first), vec!["accepted"]);
-        let second = sim.handle_payload(&payload, T0);
-        assert!(exec_kinds(&second).is_empty());
+        let cmd = drive("schachbrett");
+        assert_eq!(exec_kinds(&send(&mut sim, &cmd)), vec!["accepted"]);
+        assert!(exec_kinds(&send(&mut sim, &cmd)).is_empty());
     }
 
     #[test]
     fn cancel_and_replace_uses_old_cmd_id() {
         let mut sim = sim_at(0, 0.1);
-        sim.handle_payload(
-            &drive_payload(&[("track12", 0.6), ("station2", 0.35)], T0, 60_000),
-            T0,
-        );
+        send(&mut sim, &drive("schachbrett"));
         let old_cmd_id = sim.active.as_ref().unwrap().cmd_id();
 
-        let out = sim.handle_payload(&drive_payload(&[("track12", 0.35)], T0, 60_000), T0);
+        let out = send(&mut sim, &drive("bar"));
         assert_eq!(exec_kinds(&out), vec!["cancelled", "accepted"]);
         let cancelled_cmd_id = out
             .iter()
@@ -1013,10 +1068,7 @@ mod tests {
             b"0".to_vec(),
         ] {
             let mut sim = sim_at(0, 0.1);
-            sim.handle_payload(
-                &drive_payload(&[("track12", 0.6), ("station2", 0.35)], T0, 60_000),
-                T0,
-            );
+            send(&mut sim, &drive("schachbrett"));
             let active_cmd_id = sim.active.as_ref().unwrap().cmd_id();
 
             let out = sim.handle_payload(&stop_payload, T0);
@@ -1037,9 +1089,9 @@ mod tests {
     #[test]
     fn rfid_timeout_safe_stops() {
         let mut sim = sim_at(0, 0.1);
-        let payload = drive_payload(&[("track12", 0.6), ("station2", 0.35)], T0, 60_000);
-        let text = String::from_utf8(payload).unwrap().replace("7000", "1000");
-        sim.handle_payload(text.as_bytes(), T0);
+        let mut cmd = drive("schachbrett");
+        cmd["max_run_ms_without_tag"] = json!(1000);
+        send(&mut sim, &cmd);
         let out = run(&mut sim, 3_000);
         assert_eq!(exec_kinds(&out), vec!["failed:RFID_TIMEOUT"]);
         assert_eq!(sim.state, TrainState::SafeStop);
@@ -1074,26 +1126,9 @@ mod tests {
 
     #[test]
     fn raw_backward_reverses_and_tracks_belief() {
-        // localize first with a forward ride to station1
+        // localize with a forward ride to bar
         let mut sim = sim_at(2, 0.5);
-        sim.handle_payload(
-            &drive_payload(
-                &[
-                    ("track23", 0.6),
-                    ("station3", 0.4),
-                    ("curveB1", 0.6),
-                    ("curveB2", 0.5),
-                    ("station3", 0.4),
-                    ("track23", 0.6),
-                    ("station2", 0.4),
-                    ("track12", 0.6),
-                    ("station1", 0.35),
-                ],
-                T0,
-                60_000,
-            ),
-            T0,
-        );
+        send(&mut sim, &drive("bar"));
         run(&mut sim, 60_000);
         assert_eq!(sim.state, TrainState::Idle);
         let localized_edge = match sim.localizer.belief {
@@ -1110,7 +1145,6 @@ mod tests {
         assert_eq!(sim.motor, MotorMode::RawBackward);
         let moved_back = sim.truth.edge != start.edge || sim.truth.frac < start.frac;
         assert!(moved_back, "moved backward: {start:?} -> {:?}", sim.truth);
-        // belief followed the backward crossings
         match sim.localizer.belief {
             Belief::Localized { edge } => {
                 assert_eq!(edge, sim.truth.edge, "belief tracks truth while backing up");
@@ -1128,6 +1162,9 @@ mod tests {
             assert!(exec_kinds(&out).is_empty());
             assert!(matches!(out[0], SimOutput::Log(_)));
         }
+        let out = sim.handle_track(b"nope");
+        assert!(matches!(out[0], SimOutput::Log(_)));
+        assert!(sim.table.is_some(), "a bad table keeps the old one");
     }
 
     #[test]

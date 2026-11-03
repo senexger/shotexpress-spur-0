@@ -84,8 +84,8 @@ pub enum TrainServiceEvent {
 
 // ---- HTTP request bodies ----
 
-/// POST /api/train/command — a ride request. The server compiles the legs
-/// from track.toml; clients only name the station.
+/// POST /api/train/command — a ride request. The train holds the tag table;
+/// clients (and the drive command) only name the station.
 #[derive(Debug, Deserialize)]
 pub struct RideRequestBody {
     pub target: String,
@@ -111,7 +111,7 @@ pub struct StepsRequestBody {
 /// 0 = stopMove(), 1 = move(1000 steps), 2 = runBackward() (continuous),
 /// 3 = runForward() (continuous). Debug/maintenance only — no cmd_id, no
 /// exec events; the acked JSON commands are the real interface.
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ManualAction {
     Stop,

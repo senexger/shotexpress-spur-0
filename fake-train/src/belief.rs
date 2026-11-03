@@ -1,8 +1,8 @@
 //! The train's position belief, computed only from tag readings — never from
 //! the simulation's ground truth. The train always runs forward, so the
-//! reading order is fixed: spawn position is unknown; one reading narrows it
-//! to the tag's candidate edges (curve tags are unique, so they localize
-//! immediately); a second consecutive reading pins it down.
+//! reading order is fixed: spawn position is unknown until the first
+//! reading. Tags are one-sided and unique, so one reading localizes; the
+//! candidate/pair logic stays for tracks that reuse a tag.
 
 use crate::track::{self, NODES, READINGS};
 
@@ -152,14 +152,11 @@ mod tests {
     }
 
     #[test]
-    fn single_main_tag_gives_two_candidates() {
+    fn one_sided_main_tag_localizes_immediately() {
         let mut loc = Localizer::new();
-        let outcome = loc.on_reading(tag(2)); // station2
-        assert_eq!(outcome, LocalizeOutcome::Candidates(2));
-        match &loc.belief {
-            Belief::Candidates { edges, .. } => assert_eq!(edges, &vec![2, 9]),
-            other => panic!("expected candidates, got {other:?}"),
-        }
+        assert_eq!(loc.on_reading(tag(2)), LocalizeOutcome::JustLocalized(2)); // station2
+        let mut loc = Localizer::new();
+        assert_eq!(loc.on_reading("west2"), LocalizeOutcome::JustLocalized(9));
     }
 
     #[test]
@@ -170,21 +167,15 @@ mod tests {
     }
 
     #[test]
-    fn two_readings_localize() {
+    fn second_reading_tracks() {
         let mut loc = Localizer::new();
         loc.on_reading("station1");
         let outcome = loc.on_reading("track12");
-        assert_eq!(outcome, LocalizeOutcome::JustLocalized(1));
-
-        // the westbound pass of the same tags resolves differently
-        let mut loc = Localizer::new();
-        loc.on_reading("station2");
-        let outcome = loc.on_reading("track12");
-        assert_eq!(outcome, LocalizeOutcome::JustLocalized(10));
+        assert_eq!(outcome, LocalizeOutcome::Tracking(1));
     }
 
     #[test]
-    fn mismatch_falls_back_to_candidates() {
+    fn mismatch_relocalizes_on_the_read_tag() {
         let mut loc = Localizer::new();
         loc.on_reading("station1");
         loc.on_reading("track12"); // localized on edge 1
@@ -197,7 +188,7 @@ mod tests {
                 got: "station3"
             }
         );
-        assert!(matches!(loc.belief, Belief::Candidates { .. }));
+        assert_eq!(loc.belief, Belief::Localized { edge: 4 });
     }
 
     #[test]
@@ -217,14 +208,12 @@ mod tests {
             LocalizeOutcome::Tracking(13)
         );
 
-        // unlocalized: a backward main-line read gives candidates, and the
-        // next forward read must NOT pair with it
+        // unlocalized: a backward read crossing node 2 puts the train on edge 1
         let mut loc = Localizer::new();
         assert_eq!(
             loc.on_reading_backward("station2"),
-            LocalizeOutcome::Candidates(2)
+            LocalizeOutcome::JustLocalized(1)
         );
-        assert_eq!(loc.on_reading("track23"), LocalizeOutcome::Candidates(2));
     }
 
     #[test]

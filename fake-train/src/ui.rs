@@ -397,21 +397,23 @@ fn draw_panels(frame: &mut Frame, area: Rect, state: &UiState) {
 
     let command = match &sim.active {
         Some(Active::Drive {
-            legs,
+            target,
+            target_uid,
+            max_speed,
             ms_since_last_tag,
             max_run_ms_without_tag,
             distance_m,
             ..
         }) => vec![
+            Line::raw(format!("drive → {target} (stop tag {target_uid})")),
             Line::raw(format!(
-                "drive → {} ({} leg(s) left)",
-                legs.last().map(|l| l.tag.as_str()).unwrap_or("?"),
-                legs.len()
+                "speed {:.2} → {:.2}  (zone {}, cap {max_speed:.2})",
+                sim.speed,
+                sim.target_speed,
+                sim.zone_speed
+                    .map(|z| format!("{z:.2}"))
+                    .unwrap_or_else(|| "?".into()),
             )),
-            Line::raw(match legs.first() {
-                Some(leg) => format!("leg: {} @ {:.2}", leg.tag, leg.speed),
-                None => "leg: -".to_string(),
-            }),
             Line::raw(format!(
                 "no-tag {:.1}/{:.1} s   distance {distance_m:.1} m",
                 ms_since_last_tag / 1000.0,

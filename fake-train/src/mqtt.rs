@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
-use shotexpress_protocol::TOPIC_COMMAND;
+use shotexpress_protocol::{TOPIC_COMMAND, TOPIC_TRACK};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
@@ -13,6 +13,8 @@ pub enum MqttIn {
     Connected,
     Disconnected(String),
     Command(Vec<u8>),
+    /// Retained tag table from the server.
+    Track(Vec<u8>),
 }
 
 pub fn connect(cfg: &Config) -> (AsyncClient, EventLoop) {
@@ -41,16 +43,20 @@ pub async fn run(client: AsyncClient, mut eventloop: EventLoop, tx: mpsc::Sender
                 let subscribe_client = client.clone();
                 let subscribe_tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = subscribe_client
-                        .subscribe(TOPIC_COMMAND, QoS::AtLeastOnce)
-                        .await
-                    {
-                        let _ = subscribe_tx
-                            .send(MqttIn::Disconnected(format!("subscribe failed: {err}")))
-                            .await;
+                    for topic in [TOPIC_COMMAND, TOPIC_TRACK] {
+                        if let Err(err) = subscribe_client.subscribe(topic, QoS::AtLeastOnce).await {
+                            let _ = subscribe_tx
+                                .send(MqttIn::Disconnected(format!("subscribe {topic} failed: {err}")))
+                                .await;
+                        }
                     }
                 });
                 if tx.send(MqttIn::Connected).await.is_err() {
+                    return;
+                }
+            }
+            Ok(Event::Incoming(Packet::Publish(publish))) if publish.topic == TOPIC_TRACK => {
+                if tx.send(MqttIn::Track(publish.payload.to_vec())).await.is_err() {
                     return;
                 }
             }

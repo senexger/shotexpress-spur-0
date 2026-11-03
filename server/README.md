@@ -24,9 +24,33 @@ HTTP port (default 3000). Logging via `RUST_LOG` (default `info`).
 Requires a running MQTT broker (see `../mqtt-broker/`). `MQTT_URL` must be plain
 TCP (`mqtt://host:port`) — websocket URLs are not supported.
 
+## Order page (http://shotexpress.local)
+
+`/` is the guest page, styled like a train booking site: "Von" is fixed to the refill
+station, "Nach" lists the `unload` stations, guests enter a number of shots and hit
+**Bestellen**. Orders queue up and run one at a time, fully server-side
+(`src/orders.rs`): drive to the bar (skipped if the last tag read was the bar's),
+pour `shot_ml` per shot with a `steps` nudge between glasses, drive to the target.
+Shot size, max shots per order and the nudge wait live in `[refill]` in `track.toml`.
+
+- mDNS: the server advertises `shotexpress.local` itself (env `MDNS_HOSTNAME`,
+  empty = off). Works next to avahi. If `MQTT_URL` points at this machine
+  (`localhost`), it also advertises `_mqtt._tcp`, which the train uses to find the
+  broker without a hard-coded IP.
+- Port 80: the server also listens on `PUBLIC_PORT` (default 80, empty = off) so the
+  URL needs no port. Without root, grant it once:
+  `sudo setcap cap_net_bind_service=+ep target/release/shotexpress-server`
+  (redo after every rebuild); otherwise the page is at `http://shotexpress.local:3000`.
+
 ## API
 
-- `GET /` — dashboard (plus `/style.css`, `/app.js`)
+- `GET /` — guest order page (plus `/order.css`, `/order.js`); `#SE<n>` opens order n
+- `GET /admin` — dashboard (plus `/style.css`, `/app.js`)
+- `POST /api/order` — `{target, shots}`: queue an order (400 on unknown/non-unload
+  station or shots outside `1..=max_shots`)
+- `GET /api/orders` — orders, newest first (`phase`: queued, to_refill, fueling,
+  delivering, arrived, failed; `poured`, `ahead`, `error`, `failed_in`)
+- `GET /api/orders/{id}` — one order
 - `GET /api/train/state` — controller snapshot (`connection`, `lastStatus`, `events`,
   `isBusy`, `error`, `lastKnownTag`, `lastTagRead`)
 - `POST /api/train/command` — `{target, speed?, ttl_ms?}`: compiles a `drive` leg
@@ -55,7 +79,7 @@ TCP (`mqtt://host:port`) — websocket URLs are not supported.
 - The fuel station (refill dispenser) speaks the same envelope pattern on
   `shotexpress/fuel/command` / `shotexpress/fuel/event` / `shotexpress/fuel/status`;
   types are in the protocol crate, firmware guide in `../fuel-station/README.md`.
-  The server does not drive it yet.
+  Orders from the guest page drive it (one pour per shot, see `src/orders.rs`).
 
 ## Testing
 

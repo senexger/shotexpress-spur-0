@@ -233,6 +233,10 @@ impl App {
                 }
                 self.connected = false;
             }
+            MqttIn::Track(payload) => {
+                let outputs = self.sim.handle_track(&payload);
+                self.dispatch(outputs);
+            }
             MqttIn::Command(payload) => {
                 if self.signal() {
                     let outputs = self.sim.handle_payload(&payload, now_ms());

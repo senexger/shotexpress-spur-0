@@ -17,11 +17,14 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 
 use crate::assets;
+use crate::orders::OrderQueue;
+use crate::track::StationRole;
 use crate::service::{
     CommandError, FUEL_TTL_MS, MAX_ACCEL, MAX_FILL_ML, MAX_MOVE_STEPS, MAX_SPEED_HZ,
     TrainService,
 };
 use crate::track::TrackConfig;
+use crate::trip::Trip;
 use crate::types::{
     CommandKind, FuelCommandKind, ManualAction, RideRequestBody, StepsRequestBody, TrainServiceEvent, now_ms,
 };
@@ -54,8 +57,10 @@ fn check_speed(speed: Option<f64>, error: &str) -> Result<(), ApiResponse> {
 
 pub struct AppState {
     pub service: Arc<TrainService>,
-    pub track: RwLock<Arc<TrackConfig>>,
+    pub track: Arc<RwLock<Arc<TrackConfig>>>,
     pub track_path: PathBuf,
+    pub orders: Arc<OrderQueue>,
+    pub trip: Arc<Trip>,
 }
 
 impl AppState {
@@ -66,11 +71,20 @@ impl AppState {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(assets::index_html))
+        .route("/", get(assets::order_html))
+        .route("/order.css", get(assets::order_css))
+        .route("/order.js", get(assets::order_js))
+        .route("/logo.svg", get(assets::logo_svg))
+        .route("/banner.jpg", get(assets::banner_jpg))
+        .route("/admin", get(assets::admin_html))
+        .route("/api/order", post(post_order))
+        .route("/api/orders", get(get_orders))
+        .route("/api/orders/{id}", get(get_order))
         .route("/style.css", get(assets::style_css))
         .route("/app.js", get(assets::app_js))
         .route("/api/train/state", get(get_state))
         .route("/api/train/command", post(post_command))
+        .route("/api/trip", get(get_trip))
         .route("/api/train/steps", post(post_steps))
         .route("/api/train/manual", post(post_manual))
         .route("/api/train/speed", post(post_speed))
@@ -93,7 +107,8 @@ fn track_summary(track: &TrackConfig) -> serde_json::Value {
         "train": track.train,
         "refill": track.refill,
         "stations": track.stations,
-        "ring": track.nodes.iter().map(|n| n.tag.as_str()).collect::<Vec<_>>(),
+        "speeds": track.speeds,
+        "version": track.table().version,
     })
 }
 
@@ -105,6 +120,7 @@ async fn post_track_reload(State(state): State<Arc<AppState>>) -> impl IntoRespo
     match TrackConfig::load(&state.track_path) {
         Ok(track) => {
             let summary = track_summary(&track);
+            state.service.set_track_table(track.table());
             *state.track.write().expect("track lock poisoned") = Arc::new(track);
             tracing::info!(path = %state.track_path.display(), "track config reloaded");
             (
@@ -116,6 +132,53 @@ async fn post_track_reload(State(state): State<Arc<AppState>>) -> impl IntoRespo
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "error": "Track config rejected", "details": err })),
         ),
+    }
+}
+
+/// POST /api/order {"target": station, "shots": n} — the public order page.
+async fn post_order(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<ApiResponse, ApiResponse> {
+    #[derive(serde::Deserialize)]
+    struct OrderBody {
+        target: String,
+        shots: u32,
+    }
+
+    const ERR: &str = "Ungültige Bestellung";
+    let request: OrderBody = parse_body(&body, ERR)?;
+    let track = state.track();
+    match track.station(&request.target) {
+        Some(station) if station.role == StationRole::Unload => {}
+        _ => return Err(bad_request(ERR, &format!("Unbekannter Bahnhof {}", request.target))),
+    }
+    if request.shots == 0 || request.shots > track.refill.max_shots {
+        return Err(bad_request(
+            ERR,
+            &format!("Bitte 1 bis {} Shots bestellen", track.refill.max_shots),
+        ));
+    }
+    let order = state
+        .orders
+        .place(&track.refill.station, &request.target, request.shots);
+    Ok((StatusCode::OK, Json(json!({ "ok": true, "order": order }))))
+}
+
+async fn get_orders(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.orders.list())
+}
+
+async fn get_order(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<u32>,
+) -> Result<ApiResponse, ApiResponse> {
+    match state.orders.get(id) {
+        Some(order) => Ok((StatusCode::OK, Json(json!(order)))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Bestellung nicht gefunden" })),
+        )),
     }
 }
 
@@ -131,33 +194,30 @@ async fn post_command(
     }
 
     let track = state.track();
+    if track.station(&request.target).is_none() {
+        return Err(bad_request(
+            "Unroutable",
+            &format!("unknown station {}", request.target),
+        ));
+    }
 
-    // pin the start node from the last two consecutive progress tags; with
-    // no fix the compiled schedule covers the full ring and the train
-    // resyncs itself on its first read
-    let from_node = match state.service.last_tag_pair() {
-        (Some(prev), Some(cur)) => track.node_for_pair(&prev, &cur),
-        _ => None,
-    };
+    // a trip: drive there, then follow the station's `then` / `wait_s`.
+    // Overrides whatever the train is doing; progress is on GET /api/trip
+    state
+        .trip
+        .start(state.service.clone(), track, request.target.clone());
+    Ok((StatusCode::OK, Json(json!({ "ok": true, "trip": state.trip.status() }))))
+}
 
-    let legs = track
-        .compile_route(from_node, &request.target, request.speed)
-        .map_err(|err| bad_request("Unroutable", &err))?;
+/// Every manual control overrides the trip: stop it and free the busy
+/// slot, so the manual command goes through even mid-ride.
+fn manual_override(state: &AppState) {
+    state.trip.cancel("manual control");
+    state.service.release_current();
+}
 
-    let command = CommandKind::Drive {
-        legs,
-        accel: track.train.accel,
-        max_run_ms_without_tag: track.train.max_run_ms_without_tag,
-        ttl_ms: request.ttl_ms.unwrap_or(track.train.default_ttl_ms),
-    };
-    let cmd_id = state
-        .service
-        .send_command(command)
-        .map_err(command_error_response)?;
-    Ok((
-        StatusCode::OK,
-        Json(json!({ "ok": true, "cmd_id": cmd_id })),
-    ))
+async fn get_trip(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.trip.status())
 }
 
 async fn post_steps(
@@ -166,6 +226,7 @@ async fn post_steps(
 ) -> Result<ApiResponse, ApiResponse> {
     const ERR: &str = "Invalid steps request";
     let request: StepsRequestBody = parse_body(&body, ERR)?;
+    manual_override(&state);
     check_speed(request.speed, ERR)?;
 
     let track = state.track();
@@ -203,6 +264,14 @@ async fn post_manual(
     }
 
     let request: ManualBody = parse_body(&body, "Invalid manual command")?;
+    manual_override(&state);
+    if request.action == ManualAction::Stop {
+        // also when the train is offline: nothing queued may start later
+        let cancelled = state.orders.cancel_all("Manuell gestoppt.");
+        if cancelled > 0 {
+            tracing::warn!(cancelled, "manual stop cancelled all orders");
+        }
+    }
     state
         .service
         .send_manual_command(request.action)
@@ -223,6 +292,7 @@ async fn post_speed(
 
     const ERR: &str = "Invalid speed";
     let request: SpeedBody = parse_body(&body, ERR)?;
+    manual_override(&state);
     check_hz(request.hz, ERR)?;
     if let Some(accel) = request.accel {
         check_accel(accel, ERR)?;
@@ -250,6 +320,7 @@ async fn post_move(
 
     const ERR: &str = "Invalid move";
     let request: MoveBody = parse_body(&body, ERR)?;
+    manual_override(&state);
     if request.steps == 0 || request.steps.abs() > MAX_MOVE_STEPS {
         return Err(bad_request(
             ERR,

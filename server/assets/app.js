@@ -2,6 +2,7 @@
 
 const SNAPSHOT_URL = "/api/train/state";
 const COMMAND_URL = "/api/train/command";
+const TRIP_URL = "/api/trip";
 const MANUAL_URL = "/api/train/manual";
 const SPEED_URL = "/api/train/speed";
 const MOVE_URL = "/api/train/move";
@@ -49,6 +50,7 @@ const el = {
   connectionLabel: document.getElementById("connection-label"),
   controlError: document.getElementById("control-error"),
   stationButtons: document.getElementById("station-buttons"),
+  tripStatus: document.getElementById("trip-status"),
   manualError: document.getElementById("manual-error"),
   manualButtons: document.querySelectorAll("[data-action]"),
   speedButtons: document.getElementById("speed-buttons"),
@@ -192,7 +194,7 @@ function renderStations() {
     ...state.stations.map((station) => {
       const button = document.createElement("button");
       button.className = "button";
-      button.textContent = `Send to ${station.name}`;
+      button.textContent = `Go to ${station.name}`;
       button.dataset.station = station.name;
       button.addEventListener("click", () => sendCommand(station.name));
       return button;
@@ -207,7 +209,8 @@ function render() {
   el.controlError.hidden = !state.error;
   if (state.error) setText(el.controlError, state.error);
 
-  const disabled = state.isBusy || state.connection !== "connected";
+  // a click replaces the running trip, so busy does not lock the buttons
+  const disabled = state.connection !== "connected";
   for (const button of el.stationButtons.querySelectorAll("button")) {
     button.disabled = disabled;
   }
@@ -300,6 +303,36 @@ function render() {
   }
 }
 
+function tripText(trip) {
+  switch (trip.state) {
+    case "driving":
+      return `driving to ${trip.target}`;
+    case "waiting": {
+      const left = trip.left_s;
+      const min = Math.floor(left / 60);
+      const sec = String(left % 60).padStart(2, "0");
+      return `waiting at ${trip.at}, leaves for ${trip.next} in ${min}:${sec}`;
+    }
+    case "arrived":
+      return `waiting at ${trip.at}`;
+    case "failed":
+      return `failed on the way to ${trip.target}: ${trip.reason}`;
+    case "cancelled":
+      return `cancelled (${trip.reason})`;
+    default:
+      return "—";
+  }
+}
+
+async function pollTrip() {
+  try {
+    const response = await fetch(TRIP_URL, { cache: "no-store" });
+    if (response.ok) setText(el.tripStatus, tripText(await response.json()));
+  } catch {
+    // server unreachable: the connection label already says so
+  }
+}
+
 async function sendCommand(target) {
   state.error = null;
   try {
@@ -314,6 +347,7 @@ async function sendCommand(target) {
     }
     state.events = [];
     state.isBusy = true;
+    pollTrip();
   } catch (err) {
     state.error = err instanceof Error ? err.message : "Failed to send command";
   }
@@ -526,6 +560,8 @@ async function init() {
   el.fuelButtons[1].addEventListener("click", () => postFuel(FUEL_STOP_URL));
   // flips the fuel station to "offline" when its heartbeat stops
   setInterval(renderFuel, 1000);
+  pollTrip();
+  setInterval(pollTrip, 1000);
   el.fireButtons[0].addEventListener("click", fireTypedSpeed);
   el.fireButtons[1].addEventListener("click", fireTypedSteps);
   el.fireButtons[2].addEventListener("click", fireTypedAccel);

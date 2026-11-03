@@ -1,8 +1,12 @@
 mod assets;
 mod config;
+mod fuel_log;
+mod mdns;
+mod orders;
 mod routes;
 mod service;
 mod track;
+mod trip;
 mod types;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -36,19 +40,26 @@ async fn main() -> ExitCode {
     };
     tracing::info!(
         path = %config.track_path.display(),
-        nodes = track.nodes.len(),
         stations = track.stations.len(),
+        speed_tags = track.speeds.len(),
         "track config loaded"
     );
 
     let (service, eventloop) = service::TrainService::new(&config);
+    service.set_track_table(track.table());
     tokio::spawn(service::run_event_loop(service.clone(), eventloop));
     tokio::spawn(service::run_liveness_sweep(service.clone()));
 
+    let track = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(track)));
+    let orders = orders::OrderQueue::new();
+    tokio::spawn(orders::run_worker(orders.clone(), service.clone(), track.clone()));
+
     let app = routes::router(std::sync::Arc::new(routes::AppState {
         service,
-        track: std::sync::RwLock::new(std::sync::Arc::new(track)),
+        track,
         track_path: config.track_path.clone(),
+        orders,
+        trip: trip::Trip::new(),
     }));
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.http_port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -58,6 +69,38 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // port 80 too, so http://shotexpress.local works without a port number;
+    // best effort, since ports below 1024 need privileges
+    let mut page_port = config.http_port;
+    if let Some(public_port) = config.public_port.filter(|p| *p != config.http_port) {
+        let public_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, public_port));
+        match tokio::net::TcpListener::bind(public_addr).await {
+            Ok(public_listener) => {
+                page_port = public_port;
+                let app = app.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = axum::serve(public_listener, app).await {
+                        tracing::warn!(%err, "server on port {public_port} stopped");
+                    }
+                });
+            }
+            Err(err) => tracing::warn!(
+                %err,
+                "cannot listen on port {public_port}; run as root or grant it once with \
+                 `sudo setcap cap_net_bind_service=+ep <binary>` (PUBLIC_PORT= disables this)"
+            ),
+        }
+    }
+
+    let _mdns = config
+        .mdns_hostname
+        .as_deref()
+        .and_then(|name| {
+            let mqtt_port =
+                mdns::is_local_host(&config.mqtt_host).then_some(config.mqtt_port);
+            mdns::advertise(name, page_port, mqtt_port)
+        });
 
     tracing::info!(
         "listening on http://localhost:{} (MQTT broker {}:{})",

@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <MQTT.h>
 #include <ArduinoJson.h>
 #include <time.h>
@@ -7,7 +8,8 @@
 // Fuel station: dumb executor for shotexpress/fuel/command (see
 // ../fuel-station/README.md and protocol/src/lib.rs, "fuel station").
 // Hardware as in ../fuel-station-old/UltraschallPimpe.ino: the pump hangs on
-// an IRLZ34N low-side MOSFET, an HC-SR04 ultrasonic sensor checks for a glass.
+// an IRLZ34N low-side MOSFET, an HC-SR04 ultrasonic sensor reports the distance (diagnostics only,
+// it no longer gates pouring).
 
 constexpr int PUMP_PIN = 19; // MOSFET gate, HIGH = pump on
 constexpr int TRIG_PIN = 4;
@@ -28,12 +30,6 @@ constexpr unsigned long SENSOR_PUBLISH_INTERVAL = 250;
 constexpr float MS_PER_ML = 120.0;
 // Hard valve-open cap, independent of everything else (stuck-valve net).
 constexpr unsigned long MAX_POUR_MS = 10000;
-// TODO calibrate: sensor-to-glass distance below this means a glass is
-// present (20 cm is the threshold the old sketch switched the pump at).
-constexpr long GLASS_PRESENT_MM = 200;
-// Ultrasonic sensors miss an echo now and then; only abort a running pour
-// after this many no-glass readings in a row (~300 ms at 100 ms checks).
-constexpr int NO_GLASS_ABORT_READS = 3;
 // Reservoir estimate: one bottle; refill and reboot to reset the counter.
 constexpr unsigned long TANK_CAPACITY_ML = 700;
 
@@ -42,7 +38,12 @@ constexpr const char* pass = SECRET_PASS;
 constexpr const char* mqttClientID = "FuelStation";
 constexpr const char* mqttClientUsername = "admin";
 constexpr const char* mqttClientPassword = "123";
-constexpr const char* mqttHost = "192.168.16.127"; // same broker as the train
+// The broker is found via mDNS, same as the train (the server advertises
+// _mqtt._tcp and shotexpress.local); this IP is only the last resort.
+constexpr const char* mqttHost = "192.168.16.127";
+constexpr int mqttPort = 1883;
+constexpr const char* mqttMdnsHost = "shotexpress"; // shotexpress.local
+constexpr const char* stationMdnsName = "shotexpress-fuel";
 constexpr const char* mqttSubTopic = "shotexpress/fuel/command";
 constexpr const char* mqttEventTopic = "shotexpress/fuel/event";
 constexpr const char* mqttStatusTopic = "shotexpress/fuel/status";
@@ -55,6 +56,7 @@ WiFiServer telnetServer(23);
 WiFiClient telnetClient;
 
 unsigned long lastWifiRetry = 0;
+bool mdnsStarted = false;
 unsigned long lastStatusTime = 0;
 unsigned long lastSensorRead = 0;
 unsigned long lastSensorPublish = 0;
@@ -78,7 +80,6 @@ String activeCmdId = "";
 unsigned long pourStartedAt = 0;
 unsigned long pourDurationMs = 0;
 unsigned long dispensedMl = 0;
-int noGlassReads = 0;
 
 // ---- hardware --------------------------------------------------------------
 // The rest of the sketch only talks to these functions.
@@ -113,12 +114,6 @@ long readDistanceMm() {
   unsigned long durationUs = pulseIn(ECHO_PIN, HIGH, 30000);
   if (durationUs == 0) return -1;
   return (long)(durationUs * 0.343 / 2.0); // speed of sound: 0.343 mm/us
-}
-
-// Uses the latest reading (at most SENSOR_READ_INTERVAL old).
-// No echo counts as "no glass" — never pour on a failed measurement.
-bool glassPresent() {
-  return distanceMm >= 0 && distanceMm <= GLASS_PRESENT_MM;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,16 +275,11 @@ void messageReceived(String &topic, String &payload) {
               "reservoir estimate at zero, refill and reboot");
     return;
   }
-  if (!glassPresent()) {
-    sendEvent(cmdId, "failed", "NO_GLASS", "no glass under the spout");
-    return;
-  }
 
   sendEvent(cmdId, "accepted");
   activeCmdId = cmdId;
   pourStartedAt = millis();
   pourDurationMs = pourMs;
-  noGlassReads = 0;
   dispensedMl += volumeMl;
   pumpOn();
   debugPrintln("Status: pouring " + String(volumeMl) + " ml (" + String(pourMs) + " ms)");
@@ -323,6 +313,35 @@ const char* wifiStatusName(wl_status_t status) {
   }
 }
 
+// Point the MQTT client at the broker: _mqtt._tcp service first (gives the
+// port too), then shotexpress.local, else keep the previous/fallback address.
+// Blocks a few seconds, but only runs while MQTT is disconnected.
+void resolveBroker() {
+  if (!mdnsStarted) {
+    mdnsStarted = MDNS.begin(stationMdnsName);
+    if (!mdnsStarted) {
+      debugPrintln("mDNS start failed, using fallback broker " + String(mqttHost));
+      return;
+    }
+  }
+  int found = MDNS.queryService("mqtt", "tcp");
+  for (int i = 0; i < found; i++) {
+    IPAddress ip = MDNS.address(i);
+    if (ip != IPAddress(0, 0, 0, 0)) {
+      debugPrintln("Broker via mDNS service: " + ip.toString() + ":" + String(MDNS.port(i)));
+      mqttClient.setHost(ip, MDNS.port(i));
+      return;
+    }
+  }
+  IPAddress ip = MDNS.queryHost(mqttMdnsHost);
+  if (ip != IPAddress(0, 0, 0, 0)) {
+    debugPrintln("Broker via " + String(mqttMdnsHost) + ".local: " + ip.toString());
+    mqttClient.setHost(ip, mqttPort);
+    return;
+  }
+  debugPrintln("Broker not found via mDNS, trying last known address");
+}
+
 void handleConnection() {
   unsigned long currentMillis = millis();
 
@@ -344,6 +363,7 @@ void handleConnection() {
 
   if (!mqttClient.connected()) {
     if (currentMillis - lastWifiRetry > WIFI_RETRY_INTERVAL) {
+      resolveBroker();
       debugPrintln("Connecting MQTT...");
 
       if (mqttClient.connect(mqttClientID, mqttClientUsername, mqttClientPassword)) {
@@ -386,7 +406,11 @@ void setup() {
   telnetServer.begin();
   telnetServer.setNoDelay(true);
 
-  mqttClient.begin(mqttHost, net);
+  // begin with an IP, not a hostname: the library prefers a hostname over
+  // any IP set later, which would ignore what resolveBroker() finds
+  IPAddress fallbackBroker;
+  fallbackBroker.fromString(mqttHost);
+  mqttClient.begin(fallbackBroker, mqttPort, net);
   mqttClient.onMessage(messageReceived);
 }
 
@@ -406,11 +430,9 @@ void loop() {
     }
   }
 
-  bool freshReading = false;
   if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
     lastSensorRead = millis();
     distanceMm = readDistanceMm();
-    freshReading = true;
   }
 
   // A running pour continues offline; only the reports wait for reconnect.
@@ -421,12 +443,6 @@ void loop() {
     } else if (millis() - pourStartedAt >= pourDurationMs) {
       finishPour("completed");
       debugPrintln("Status: pour completed");
-    } else if (freshReading) {
-      noGlassReads = glassPresent() ? 0 : noGlassReads + 1;
-      if (noGlassReads >= NO_GLASS_ABORT_READS) {
-        finishPour("failed", "NO_GLASS", "glass removed mid-pour");
-        debugPrintln("Error: glass removed mid-pour");
-      }
     }
   }
 }

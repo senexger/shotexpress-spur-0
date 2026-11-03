@@ -1,8 +1,9 @@
 //! Track topology: a main line with a passive turnaround loop at each end
 //! (dogbone). Flattened, this is a single ring of tag *readings*: eastbound
 //! main line, loop B, westbound main line (same physical track, opposite
-//! pass), loop A. Main-line tags therefore appear at two ring nodes, curve
-//! tags at one.
+//! pass), loop A. Tags are read from one side only (ETCS-style balises), so
+//! each direction has its own tags and every reading is unique: one read
+//! pins the position. Stations are only served eastbound.
 //!
 //! The train can only run forward — the passive switches make every lap take
 //! the same route — so motion is always increasing ring index. Crossing into
@@ -15,7 +16,7 @@ pub const NODES: usize = 14;
 pub const READINGS: [&str; NODES] = [
     "station1", "track12", "station2", "track23", "station3", // 0..=4  eastbound main line
     "curveB1", "curveB2", // 5..=6  loop B (east turnaround)
-    "station3", "track23", "station2", "track12", "station1", // 7..=11 westbound main line
+    "west3", "west23", "west2", "west12", "west1", // 7..=11 westbound main line
     "curveA1", "curveA2", // 12..=13 loop A (west turnaround)
 ];
 
@@ -57,17 +58,17 @@ pub const EDGES: [Edge; NODES] = [
     LOOP_LINK,  // 4  station3 -> curveB1
     TURNAROUND, // 5  curveB1  -> curveB2
     LOOP_LINK,  // 6  curveB2  -> station3
-    MAIN,       // 7  station3 -> track23
-    MAIN,       // 8  track23  -> station2
-    MAIN,       // 9  station2 -> track12
-    MAIN,       // 10 track12  -> station1
-    LOOP_LINK,  // 11 station1 -> curveA1
+    MAIN,       // 7  west3    -> west23
+    MAIN,       // 8  west23   -> west2
+    MAIN,       // 9  west2    -> west12
+    MAIN,       // 10 west12   -> west1
+    LOOP_LINK,  // 11 west1    -> curveA1
     TURNAROUND, // 12 curveA1  -> curveA2
     LOOP_LINK,  // 13 curveA2  -> station1
 ];
 
-/// Slowest speed a sane leg schedule commands on the turnaround edges —
-/// mirrors the `speed_limit = 0.5` on the curve nodes in track.toml.
+/// Slowest speed track.toml's speed tags command on the turnaround edges
+/// (the curve tags' `speed = 0.5`).
 #[cfg_attr(not(test), allow(dead_code))]
 pub const CRAWL_SPEED: f64 = 0.5;
 
@@ -112,18 +113,15 @@ mod tests {
     fn localize_finds_unique_edge() {
         // eastbound: passed track12 after station1 -> on edge 1
         assert_eq!(localize("station1", "track12"), Some(1));
-        // westbound pass of the same tags: station2 then track12 -> edge 10
-        assert_eq!(localize("station2", "track12"), Some(10));
+        // westbound tags are their own
+        assert_eq!(localize("west2", "west12"), Some(10));
         // nonsense pair
         assert_eq!(localize("station1", "station3"), None);
     }
 
     #[test]
-    fn main_tags_have_two_nodes_curve_tags_one() {
-        for tag in ["station1", "track12", "station2", "track23", "station3"] {
-            assert_eq!(nodes_for_tag(tag).len(), 2, "{tag}");
-        }
-        for tag in ["curveA1", "curveA2", "curveB1", "curveB2"] {
+    fn every_tag_sits_at_exactly_one_node() {
+        for tag in READINGS {
             assert_eq!(nodes_for_tag(tag).len(), 1, "{tag}");
         }
     }
@@ -139,7 +137,7 @@ mod tests {
             .max()
             .unwrap();
         // mirrors [train] max_run_ms_without_tag in track.toml
-        let default_timeout = 7_000;
+        let default_timeout = 30_000;
         assert!(
             worst_ms < default_timeout,
             "worst gap {worst_ms} ms would trip the {default_timeout} ms RFID timeout"
