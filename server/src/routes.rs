@@ -1,6 +1,5 @@
 use std::convert::Infallible;
-use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -26,7 +25,7 @@ use crate::service::{
 use crate::track::TrackConfig;
 use crate::trip::Trip;
 use crate::types::{
-    CommandKind, FuelCommandKind, ManualAction, RideRequestBody, StepsRequestBody, TrainServiceEvent, now_ms,
+    FuelCommandKind, ManualAction, RideRequestBody, TrainServiceEvent, now_ms,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
@@ -57,17 +56,11 @@ fn check_speed(speed: Option<f64>, error: &str) -> Result<(), ApiResponse> {
 
 pub struct AppState {
     pub service: Arc<TrainService>,
-    pub track: Arc<RwLock<Arc<TrackConfig>>>,
-    pub track_path: PathBuf,
+    pub track: Arc<TrackConfig>,
     pub orders: Arc<OrderQueue>,
     pub trip: Arc<Trip>,
 }
 
-impl AppState {
-    fn track(&self) -> Arc<TrackConfig> {
-        self.track.read().expect("track lock poisoned").clone()
-    }
-}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -85,7 +78,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/train/state", get(get_state))
         .route("/api/train/command", post(post_command))
         .route("/api/trip", get(get_trip))
-        .route("/api/train/steps", post(post_steps))
         .route("/api/train/manual", post(post_manual))
         .route("/api/train/speed", post(post_speed))
         .route("/api/train/move", post(post_move))
@@ -94,7 +86,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fuel/stop", post(post_fuel_stop))
         .route("/api/train/stream", get(get_stream))
         .route("/api/track", get(get_track))
-        .route("/api/admin/track/reload", post(post_track_reload))
         .with_state(state)
 }
 
@@ -113,29 +104,9 @@ fn track_summary(track: &TrackConfig) -> serde_json::Value {
 }
 
 async fn get_track(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(track_summary(&state.track()))
+    Json(track_summary(&state.track))
 }
 
-async fn post_track_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match TrackConfig::load(&state.track_path) {
-        Ok(track) => {
-            let summary = track_summary(&track);
-            state.service.set_track_table(track.table());
-            *state.track.write().expect("track lock poisoned") = Arc::new(track);
-            tracing::info!(path = %state.track_path.display(), "track config reloaded");
-            (
-                StatusCode::OK,
-                Json(json!({ "ok": true, "track": summary })),
-            )
-        }
-        Err(err) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "Track config rejected", "details": err })),
-        ),
-    }
-}
-
-/// POST /api/order {"target": station, "shots": n} — the public order page.
 async fn post_order(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -148,7 +119,7 @@ async fn post_order(
 
     const ERR: &str = "Ungültige Bestellung";
     let request: OrderBody = parse_body(&body, ERR)?;
-    let track = state.track();
+    let track = &state.track;
     match track.station(&request.target) {
         Some(station) if station.role == StationRole::Unload => {}
         _ => return Err(bad_request(ERR, &format!("Unbekannter Bahnhof {}", request.target))),
@@ -193,7 +164,7 @@ async fn post_command(
         return Err(bad_request(ERR, "ttl_ms must be positive"));
     }
 
-    let track = state.track();
+    let track = &state.track;
     if track.station(&request.target).is_none() {
         return Err(bad_request(
             "Unroutable",
@@ -205,7 +176,7 @@ async fn post_command(
     // Overrides whatever the train is doing; progress is on GET /api/trip
     state
         .trip
-        .start(state.service.clone(), track, request.target.clone());
+        .start(state.service.clone(), track.clone(), request.target.clone());
     Ok((StatusCode::OK, Json(json!({ "ok": true, "trip": state.trip.status() }))))
 }
 
@@ -218,40 +189,6 @@ fn manual_override(state: &AppState) {
 
 async fn get_trip(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.trip.status())
-}
-
-async fn post_steps(
-    State(state): State<Arc<AppState>>,
-    body: Bytes,
-) -> Result<ApiResponse, ApiResponse> {
-    const ERR: &str = "Invalid steps request";
-    let request: StepsRequestBody = parse_body(&body, ERR)?;
-    manual_override(&state);
-    check_speed(request.speed, ERR)?;
-
-    let track = state.track();
-    let command = CommandKind::Steps {
-        steps: request.steps.unwrap_or(track.refill.steps),
-        direction: request.direction,
-        speed: request.speed.unwrap_or(track.refill.speed),
-        ttl_ms: request.ttl_ms.unwrap_or(track.train.default_ttl_ms),
-    };
-    let cmd_id = state
-        .service
-        .send_command(command)
-        .map_err(command_error_response)?;
-    Ok((
-        StatusCode::OK,
-        Json(json!({ "ok": true, "cmd_id": cmd_id })),
-    ))
-}
-
-fn command_error_response(err: CommandError) -> ApiResponse {
-    let status = match err {
-        CommandError::Busy => StatusCode::CONFLICT,
-        CommandError::NotConnected | CommandError::Publish(_) => StatusCode::SERVICE_UNAVAILABLE,
-    };
-    (status, Json(json!({ "error": err.message() })))
 }
 
 async fn post_manual(

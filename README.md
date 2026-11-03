@@ -2,11 +2,13 @@
 
 A wifi-controlled shotexpress with:
 - `/train` - ESP controlling the motor and RFID reader
-- `/webserver` -  Next.js/Typescript orchestrating routes and state
+- `/server` - Rust server: web pages, MQTT broker, routes and state
+- `/fuel-station` - ESP pouring the shots
+- `/fake-train` - train simulator for testing without hardware
 
 ## 1) Communication Architecture
 
-Webserver and train connect to an MQTT broker and communicate over the following topics:
+Server and train talk over the server's built-in MQTT broker and communicate over the following topics:
 
 ```
 shotexpress/
@@ -96,7 +98,7 @@ Topic: `shotexpress/status` (QoS 0, not retained)
 
 Normal states running from the bar to the Raucherecke: `IDLE → RUNNING → APPROACH → DWELL → IDLE`.
 
-- `IDLE`: Train waits and saves power. Waits for new commands from webserver.
+- `IDLE`: Train waits and saves power. Waits for new commands from the server.
 - `RUNNING`: Train executes a command.
 - `APPROACH`: begins after N consecutive missed expected tags, or on a configured distance/time threshold; speed = crawl_speed.
 - `SAFE_STOP`: engages on max_run_ms_without_tag, cancel, or broker disconnect; motor off, networking on; emits failed or cancelled. 
@@ -106,7 +108,7 @@ Normal states running from the bar to the Raucherecke: `IDLE → RUNNING → APP
 
 ```
 on command(move_to p):
-  if now > command_ts + ttl: ignore  # each webserver command has a ttl. If that expires, fall back to max_runtime_ms_without_tag
+  if now > command_ts + ttl: ignore  # each server command has a ttl. If that expires, fall back to max_runtime_ms_without_tag
   ack_id = msg_id
   set speed = p.speed, dir = p.direction
   deadline = now + p.max_runtime_ms_without_tag
@@ -136,7 +138,6 @@ This should be okay for a first iteration though.
 ### Train Setup
 Todo: Write this.
 
-### Webserver Setup
-1. Navigate to the `webserver/` directory
-1. Run `pnpm fake:train` to start the train simulation
-1. Run `pnpm run dev` to start the development server
+### Server Setup
+1. `cargo run -p shotexpress-server` (see `server/README.md`)
+1. `cargo run -p fake-train` to simulate the train

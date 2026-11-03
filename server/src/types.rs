@@ -95,18 +95,6 @@ pub struct RideRequestBody {
     pub ttl_ms: Option<u64>,
 }
 
-/// POST /api/train/steps — a positioning nudge (refill choreography).
-#[derive(Debug, Deserialize)]
-pub struct StepsRequestBody {
-    #[serde(default)]
-    pub steps: Option<u32>,
-    pub direction: Direction,
-    #[serde(default)]
-    pub speed: Option<f64>,
-    #[serde(default)]
-    pub ttl_ms: Option<u64>,
-}
-
 /// Raw firmware integers on shotexpress/command, matching Train.ino:
 /// 0 = stopMove(), 1 = move(1000 steps), 2 = runBackward() (continuous),
 /// 3 = runForward() (continuous). Debug/maintenance only — no cmd_id, no

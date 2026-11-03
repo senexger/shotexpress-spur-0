@@ -20,7 +20,7 @@ pub fn start(cfg: &Config) -> Result<(), String> {
     drop(TcpListener::bind(listen).map_err(|err| {
         format!(
             "MQTT broker cannot listen on {listen}: {err} \
-             (another broker running? e.g. `docker compose down` in mqtt-broker/)"
+             (another broker running?)"
         )
     })?);
 

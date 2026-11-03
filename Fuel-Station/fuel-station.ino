@@ -7,7 +7,7 @@
 
 // Fuel station: dumb executor for shotexpress/fuel/command (see
 // ../fuel-station/README.md and protocol/src/lib.rs, "fuel station").
-// Hardware as in ../fuel-station-old/UltraschallPimpe.ino: the pump hangs on
+// Hardware: the pump hangs on
 // an IRLZ34N low-side MOSFET, an HC-SR04 ultrasonic sensor reports the distance (diagnostics only,
 // it no longer gates pouring).
 

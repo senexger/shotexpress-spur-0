@@ -5,8 +5,7 @@ at compile time from `assets/`), owns the track map, and talks MQTT to the train
 No Node, no build step — `cargo build --release` produces one self-contained binary.
 
 The wire protocol lives in `../protocol/` (shared serde types + golden-shape tests);
-`../fake-train/` is the reference implementation of the train side. The old Next.js
-`webserver/` is kept only until the real train is verified against this server.
+`../fake-train/` is the reference implementation of the train side.
 
 ## Run
 
@@ -64,14 +63,11 @@ Shot size, max shots per order and the nudge wait live in `[refill]` in `track.t
   `isBusy`, `error`, `lastKnownTag`, `lastTagRead`)
 - `POST /api/train/command` — `{target, speed?, ttl_ms?}`: compiles a `drive` leg
   schedule from `track.toml` to the named station (409 when busy, 503 when disconnected)
-- `POST /api/train/steps` — `{direction, steps?, speed?, ttl_ms?}`: precise positioning
-  nudge for refill; defaults come from `[refill]` in `track.toml`
 - `POST /api/train/manual` — `{action: "stop"|"steps"|"forward"|"backward"}`, published
   as raw firmware integers `0`/`1`/`3`/`2` (Train.ino: stopMove, move 1000 steps,
   runForward, runBackward). Debug/setup only — no cmd_id, no exec events
 - `GET /api/train/stream` — SSE stream of service events (snapshot first, 25 s heartbeat)
 - `GET /api/track` — track summary (train params, refill, stations, ring order)
-- `POST /api/admin/track/reload` — re-read and validate `track.toml` without restart
 
 ## Protocol notes
 

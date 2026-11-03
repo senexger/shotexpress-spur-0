@@ -60,14 +60,13 @@ async fn main() -> ExitCode {
     tokio::spawn(service::run_event_loop(service.clone(), eventloop));
     tokio::spawn(service::run_liveness_sweep(service.clone()));
 
-    let track = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(track)));
+    let track = std::sync::Arc::new(track);
     let orders = orders::OrderQueue::new();
     tokio::spawn(orders::run_worker(orders.clone(), service.clone(), track.clone()));
 
     let app = routes::router(std::sync::Arc::new(routes::AppState {
         service,
         track,
-        track_path: config.track_path.clone(),
         orders,
         trip: trip::Trip::new(),
     }));

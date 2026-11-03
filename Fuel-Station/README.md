@@ -119,8 +119,7 @@ Die Referenz-Implementierung liegt hier im Ordner: **`fuel-station.ino`**
 `Train/Train.ino` inkl. Telnet-Debug-Konsole auf Port 23). Bibliotheken:
 „MQTT" (256dpi) und „ArduinoJson" aus dem Library Manager.
 
-Die Hardware ist im Abschnitt **„hardware"** schon verdrahtet (übernommen
-aus `fuel-station-old/UltraschallPimpe.ino`): Pumpe über IRLZ34N-MOSFET
+Die Hardware ist im Abschnitt **„hardware"** schon verdrahtet: Pumpe über IRLZ34N-MOSFET
 (Low-side) an GPIO19, HC-SR04 mit TRIG=4 und ECHO=5.
 Der Sensor dient nur noch der Diagnose (Abstand auf `shotexpress/fuel/sensor`);
 die Glas-Prüfung ist entfernt, gegossen wird auch ohne erkanntes Glas.

@@ -5,18 +5,6 @@ Train/.clang-format
 Train/credentials.h
 fuel-station/credentials.h
 
-# Webserver project files
-webserver/node_modules/
-webserver/dist/
-webserver/.env
-webserver/npm-debug.log*
-webserver/yarn-debug.log*
-webserver/yarn-error.log*
-
-mqtt-broker/pwfile
-mqtt-broker/.env
-mqtt-broker/data/mosquitto.db
-
 # Rust workspace
 /target
 /logs
@@ -36,25 +24,8 @@ __pycache__/
 *.swp
 *.swo
 
-# JavaScript/TypeScript projects
-node_modules/
-dist/
-build/
-.pnp.*
-.pnpm-store/
-
-# Next.js
-.next/
-.turbo/
-out/
-.vercel/
-
 # Environment files
 .env
-webserver/.env.local
-.env.development
-.env.production
-.env.test
 !.env.example
 
 # IDE and tooling

@@ -5,7 +5,7 @@
 //! to the ordered station.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -185,7 +185,7 @@ impl OrderQueue {
 pub async fn run_worker(
     queue: Arc<OrderQueue>,
     service: Arc<TrainService>,
-    track: Arc<RwLock<Arc<TrackConfig>>>,
+    track: Arc<TrackConfig>,
 ) {
     loop {
         // listen for a cancel before picking the order: a cancel that comes
@@ -197,7 +197,6 @@ pub async fn run_worker(
             queue.wake.notified().await;
             continue;
         };
-        let track = track.read().expect("track lock poisoned").clone();
         tracing::info!(id = order.id, target = %order.target, shots = order.shots, "order started");
         let result = tokio::select! {
             result = run_order(&queue, &service, &track, &order) => result,
