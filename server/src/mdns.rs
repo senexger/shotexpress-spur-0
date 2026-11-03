@@ -2,8 +2,8 @@
 //! records) plus an `_http._tcp` service, so guests can open
 //! http://shotexpress.local on their phones.
 //!
-//! When the MQTT broker runs on this machine, an `_mqtt._tcp` service is
-//! announced too, so the train finds the broker whatever IP the laptop got.
+//! An `_mqtt._tcp` service is announced too, so the train finds the broker
+//! whatever IP the laptop got.
 //!
 //! Only physical interfaces (WiFi, ethernet) are announced: Docker bridges
 //! and veth pairs would hand phones an address they cannot reach.
@@ -12,8 +12,7 @@
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 
 /// Keep the returned daemon alive for as long as the name should resolve.
-/// `mqtt_port`: the local broker's port, or None if the broker lives elsewhere.
-pub fn advertise(name: &str, port: u16, mqtt_port: Option<u16>) -> Option<ServiceDaemon> {
+pub fn advertise(name: &str, port: u16, mqtt_port: u16) -> Option<ServiceDaemon> {
     let host = format!("{name}.local.");
     let interfaces = lan_interfaces();
     let result = ServiceDaemon::new().and_then(|daemon| {
@@ -28,12 +27,10 @@ pub fn advertise(name: &str, port: u16, mqtt_port: Option<u16>) -> Option<Servic
         let info = ServiceInfo::new("_http._tcp.local.", "ShotExpress", &host, "", port, None)?
             .enable_addr_auto();
         daemon.register(info)?;
-        if let Some(mqtt_port) = mqtt_port {
-            let info =
-                ServiceInfo::new("_mqtt._tcp.local.", "ShotExpress", &host, "", mqtt_port, None)?
-                    .enable_addr_auto();
-            daemon.register(info)?;
-        }
+        let info =
+            ServiceInfo::new("_mqtt._tcp.local.", "ShotExpress", &host, "", mqtt_port, None)?
+                .enable_addr_auto();
+        daemon.register(info)?;
         Ok(daemon)
     });
     match result {
@@ -48,9 +45,7 @@ pub fn advertise(name: &str, port: u16, mqtt_port: Option<u16>) -> Option<Servic
                 interfaces.join(", ")
             };
             tracing::info!("order page advertised via mDNS at {url} (on {on})");
-            if let Some(mqtt_port) = mqtt_port {
-                tracing::info!("MQTT broker advertised via mDNS as _mqtt._tcp on port {mqtt_port}");
-            }
+            tracing::info!("MQTT broker advertised via mDNS as _mqtt._tcp on port {mqtt_port}");
             Some(daemon)
         }
         Err(err) => {
@@ -80,9 +75,4 @@ fn lan_interfaces() -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-/// True if the broker host is this machine, so its port can be advertised.
-pub fn is_local_host(host: &str) -> bool {
-    matches!(host, "localhost" | "::1" | "0.0.0.0") || host.starts_with("127.")
 }

@@ -1,4 +1,6 @@
-# MQTT Broker Setup
+# MQTT Broker Setup (optional)
+
+Unused: the Rust server has a built-in broker now (see `server/README.md`).
 
 This directory contains the configuration for a Mosquitto MQTT broker running in Docker.
 

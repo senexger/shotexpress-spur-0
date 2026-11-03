@@ -1,10 +1,12 @@
 mod assets;
+mod broker;
 mod config;
 mod fuel_log;
 mod mdns;
 mod orders;
 mod routes;
 mod service;
+mod settings;
 mod track;
 mod trip;
 mod types;
@@ -19,7 +21,11 @@ async fn main() -> ExitCode {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            // rumqttd logs every connection at info, and a harmless
+            // "connection id N is already gone" error at every disconnect
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("info,rumqttd=warn,rumqttd::router::routing=off")
+            }),
         )
         .init();
 
@@ -45,6 +51,10 @@ async fn main() -> ExitCode {
         "track config loaded"
     );
 
+    if let Err(err) = broker::start(&config) {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
     let (service, eventloop) = service::TrainService::new(&config);
     service.set_track_table(track.table());
     tokio::spawn(service::run_event_loop(service.clone(), eventloop));
@@ -96,16 +106,11 @@ async fn main() -> ExitCode {
     let _mdns = config
         .mdns_hostname
         .as_deref()
-        .and_then(|name| {
-            let mqtt_port =
-                mdns::is_local_host(&config.mqtt_host).then_some(config.mqtt_port);
-            mdns::advertise(name, page_port, mqtt_port)
-        });
+        .and_then(|name| mdns::advertise(name, page_port, config.mqtt_port));
 
     tracing::info!(
-        "listening on http://localhost:{} (MQTT broker {}:{})",
+        "listening on http://localhost:{} (MQTT on port {})",
         config.http_port,
-        config.mqtt_host,
         config.mqtt_port
     );
 

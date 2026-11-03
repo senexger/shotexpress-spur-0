@@ -11,7 +11,7 @@ The wire protocol lives in `../protocol/` (shared serde types + golden-shape tes
 ## Run
 
 ```sh
-cp .env.example .env   # set MQTT_URL / MQTT_USERNAME / MQTT_PASSWORD
+cp .env.example .env   # set MQTT_USERNAME / MQTT_PASSWORD
 cargo run              # dev, http://localhost:3000
 cargo build --release  # binary at target/release/shotexpress-server
 ```
@@ -21,8 +21,18 @@ The binary needs a `.env` (or the env vars) next to it, plus a `track.toml`
 (path via `TRACK_CONFIG`, default repo-root `track.toml`). `PORT` overrides the
 HTTP port (default 3000). Logging via `RUST_LOG` (default `info`).
 
-Requires a running MQTT broker (see `../mqtt-broker/`). `MQTT_URL` must be plain
-TCP (`mqtt://host:port`) — websocket URLs are not supported.
+The server is also the MQTT broker (built-in rumqttd): train, fuel station and
+fake-train connect to it on port 1883 with `MQTT_USERNAME`/`MQTT_PASSWORD` (no login
+required if those are unset). No Docker needed.
+
+- `MQTT_PORT` (default 1883): plain TCP only, no websockets. If the port is taken
+  (e.g. the old Docker Mosquitto still running) the server refuses to start.
+- The built-in broker keeps retained messages in memory only. The server re-sends
+  the tag table on connect and saves speed/accel to `SETTINGS_PATH` (default
+  `train-settings.json`), re-publishing them at startup.
+- Restarting the server disconnects the train and fuel station for a few seconds
+  while they reconnect. A manual forward/backward keeps running meanwhile (drives
+  still stop on their RFID watchdog).
 
 ## Order page (http://shotexpress.local)
 
@@ -34,9 +44,8 @@ pour `shot_ml` per shot with a `steps` nudge between glasses, drive to the targe
 Shot size, max shots per order and the nudge wait live in `[refill]` in `track.toml`.
 
 - mDNS: the server advertises `shotexpress.local` itself (env `MDNS_HOSTNAME`,
-  empty = off). Works next to avahi. If `MQTT_URL` points at this machine
-  (`localhost`), it also advertises `_mqtt._tcp`, which the train uses to find the
-  broker without a hard-coded IP.
+  empty = off). Works next to avahi. It also advertises `_mqtt._tcp`, which the
+  train uses to find the broker without a hard-coded IP.
 - Port 80: the server also listens on `PUBLIC_PORT` (default 80, empty = off) so the
   URL needs no port. Without root, grant it once:
   `sudo setcap cap_net_bind_service=+ep target/release/shotexpress-server`

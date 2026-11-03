@@ -20,6 +20,14 @@ mqtt-broker/data/mosquitto.db
 # Rust workspace
 /target
 /logs
+/train-settings.json
+
+# CAD: FreeCAD autosave backups, manual backup copies, script bytecode
+*.FCBak
+*.FCStd1
+CAD/**/backups/
+__pycache__/
+*.pyc
 
 # General ignores
 .DS_Store

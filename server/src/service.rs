@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::fuel_log::FuelLog;
+use crate::settings::{self, TrainSettings};
 use crate::types::{
     CmdId, CommandKind, CommandMessage, ConnectionState, ControllerSnapshot, Envelope, ExecEvent,
     ExecKind, FuelCommandKind, FuelCommandMessage, FuelEvent, FuelStatusMessage, ManualAction,
@@ -89,6 +91,9 @@ pub struct TrainService {
     fuel_log: Mutex<FuelLog>,
     /// Tag table from track.toml, (re)published retained on every connect.
     track_table: Mutex<Option<TrackTable>>,
+    /// Speed/accel are saved here and re-published at startup, since the
+    /// built-in broker forgets retained messages.
+    settings_path: PathBuf,
     tx: broadcast::Sender<TrainServiceEvent>,
 }
 
@@ -96,7 +101,7 @@ impl TrainService {
     pub fn new(cfg: &Config) -> (Arc<Self>, EventLoop) {
         let mut options = MqttOptions::new(
             cfg.mqtt_client_id.clone(),
-            cfg.mqtt_host.clone(),
+            "localhost",
             cfg.mqtt_port,
         );
         options.set_keep_alive(Duration::from_secs(60));
@@ -107,6 +112,7 @@ impl TrainService {
 
         let (client, eventloop) = AsyncClient::new(options, 16);
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let saved = settings::load(&cfg.settings_path);
 
         let service = Arc::new(TrainService {
             client,
@@ -125,16 +131,28 @@ impl TrainService {
                 last_raw_status: None,
                 train_last_seen_ms: None,
                 train_online: false,
-                speed_hz: None,
-                accel: None,
+                speed_hz: saved.speed_hz,
+                accel: saved.accel,
                 fuel_last_event: None,
                 fuel_status: None,
                 fuel_distance_mm: None,
             }),
             fuel_log: Mutex::new(FuelLog::open(&cfg.fuel_log_dir)),
             track_table: Mutex::new(None),
+            settings_path: cfg.settings_path.clone(),
             tx,
         });
+
+        // queued until the first connect; retained, so the train gets them on
+        // every (re)connect from then on
+        for (topic, payload, retain) in settings_messages(saved.speed_hz, saved.accel) {
+            if let Err(err) = service.client.try_publish(topic, QoS::AtLeastOnce, retain, payload) {
+                tracing::warn!(%err, topic, "cannot restore saved setting");
+            }
+        }
+        if saved != TrainSettings::default() {
+            tracing::info!(speed_hz = ?saved.speed_hz, accel = ?saved.accel, "restored train settings");
+        }
 
         (service, eventloop)
     }
@@ -417,6 +435,17 @@ impl TrainService {
         Ok(())
     }
 
+    fn save_settings(&self) {
+        let current = {
+            let state = self.lock();
+            TrainSettings {
+                speed_hz: state.speed_hz,
+                accel: state.accel,
+            }
+        };
+        settings::save(&self.settings_path, current);
+    }
+
     fn lock(&self) -> MutexGuard<'_, ServiceState> {
         self.state.lock().expect("train service state poisoned")
     }
@@ -522,7 +551,10 @@ impl TrainService {
                     tracing::warn!(payload = %raw, "ignoring non-integer accel payload");
                     return;
                 };
-                self.lock().accel = Some(accel);
+                let changed = self.lock().accel.replace(accel) != Some(accel);
+                if changed {
+                    self.save_settings();
+                }
                 let _ = self.tx.send(TrainServiceEvent::Accel(accel));
             }
             TOPIC_SPEED => {
@@ -531,7 +563,10 @@ impl TrainService {
                     tracing::warn!(payload = %raw, "ignoring non-integer speed payload");
                     return;
                 };
-                self.lock().speed_hz = Some(hz);
+                let changed = self.lock().speed_hz.replace(hz) != Some(hz);
+                if changed {
+                    self.save_settings();
+                }
                 let _ = self.tx.send(TrainServiceEvent::Speed(hz));
             }
             other => {
@@ -736,11 +771,12 @@ pub(crate) mod tests {
     /// The event loop is returned only to keep the channel open.
     pub(crate) fn service() -> (Arc<TrainService>, EventLoop) {
         let cfg = Config {
-            mqtt_host: "localhost".into(),
             mqtt_port: 1883,
             mqtt_username: None,
             mqtt_password: None,
             mqtt_client_id: "test".into(),
+            // never written: the tests don't receive speed/accel messages
+            settings_path: std::env::temp_dir().join("shotexpress-test-settings.json"),
             http_port: 0,
             public_port: None,
             mdns_hostname: None,
